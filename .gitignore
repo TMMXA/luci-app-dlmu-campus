@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+Thumbs.db
+*.tar.gz
+*.ipk
+*.apk
+.env

@@ -1,0 +1,252 @@
+<%+header%>
+
+<%
+local sys = require "luci.sys"
+local fs = require "nixio.fs"
+local jsonc = require "luci.jsonc"
+local status_file = "/var/run/dlmu-campus-login/status.json"
+local status = {}
+local raw = fs.readfile(status_file)
+if raw then
+	status = jsonc.parse(raw) or {}
+end
+
+local function h(v)
+	return pcdata(tostring(v or ""))
+end
+
+local function bool_text(v)
+	if v == true then return "是" end
+	if v == false then return "否" end
+	return "未知"
+end
+
+local function duration(seconds)
+	seconds = tonumber(seconds or 0) or 0
+	if seconds < 0 then seconds = 0 end
+	local d = math.floor(seconds / 86400)
+	seconds = seconds % 86400
+	local h = math.floor(seconds / 3600)
+	seconds = seconds % 3600
+	local m = math.floor(seconds / 60)
+	local s = seconds % 60
+	if d > 0 then return string.format("%d 天 %d 小时 %d 分", d, h, m) end
+	if h > 0 then return string.format("%d 小时 %d 分 %d 秒", h, m, s) end
+	if m > 0 then return string.format("%d 分 %d 秒", m, s) end
+	return string.format("%d 秒", s)
+end
+
+local running = sys.call("pgrep -f '/usr/bin/dlmu-campus-login --daemon' >/dev/null 2>&1") == 0
+local online = status.online == true
+local online_duration = status.online_duration
+if online and status.online_since then
+	online_duration = duration(os.time() - tonumber(status.online_since))
+end
+%>
+
+<style>
+.dlmu-wrap {
+	margin-top: 12px;
+}
+.dlmu-hero {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	gap: 18px;
+	padding: 18px 20px;
+	border-radius: 10px;
+	background: linear-gradient(135deg, #10233f 0%, #16636f 52%, #45a36f 100%);
+	color: #fff;
+	box-shadow: 0 10px 28px rgba(16, 35, 63, .22);
+}
+.dlmu-hero h2 {
+	margin: 0 0 5px 0;
+	color: #fff;
+	letter-spacing: 0;
+}
+.dlmu-hero p {
+	margin: 0;
+	opacity: .88;
+}
+.dlmu-badge {
+	display: inline-flex;
+	align-items: center;
+	gap: 8px;
+	padding: 8px 12px;
+	border-radius: 999px;
+	background: rgba(255,255,255,.16);
+	border: 1px solid rgba(255,255,255,.28);
+	font-weight: 700;
+	white-space: nowrap;
+}
+.dlmu-dot {
+	width: 10px;
+	height: 10px;
+	border-radius: 50%;
+	background: <%=online and "#3ef08a" or "#ffda65"%>;
+	box-shadow: 0 0 0 4px <%=online and "rgba(62,240,138,.18)" or "rgba(255,218,101,.20)"%>;
+}
+.dlmu-grid {
+	display: grid;
+	grid-template-columns: repeat(4, minmax(0, 1fr));
+	gap: 12px;
+	margin-top: 14px;
+}
+.dlmu-card {
+	border: 1px solid #d7e0ea;
+	border-radius: 8px;
+	background: #fff;
+	padding: 14px;
+	box-shadow: 0 6px 18px rgba(21, 45, 72, .07);
+	min-height: 84px;
+}
+.dlmu-card strong {
+	display: block;
+	color: #52627a;
+	font-size: 12px;
+	margin-bottom: 8px;
+}
+.dlmu-card span {
+	display: block;
+	color: #10233f;
+	font-size: 20px;
+	font-weight: 800;
+	line-height: 1.25;
+	word-break: break-word;
+}
+.dlmu-card small {
+	display: block;
+	margin-top: 6px;
+	color: #7a8797;
+}
+.dlmu-wide {
+	grid-column: span 2;
+}
+.dlmu-section {
+	margin-top: 14px;
+	padding: 16px;
+	border: 1px solid #d7e0ea;
+	border-radius: 8px;
+	background: #f8fbfd;
+}
+.dlmu-section h3 {
+	margin-top: 0;
+}
+.dlmu-kv {
+	display: grid;
+	grid-template-columns: 160px 1fr;
+	gap: 8px 12px;
+}
+.dlmu-kv div:nth-child(odd) {
+	color: #68778b;
+}
+.dlmu-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 10px;
+}
+.dlmu-log {
+	max-height: 280px;
+	overflow: auto;
+	background: #0d1726;
+	color: #d7f7e5;
+	border-radius: 8px;
+	padding: 12px;
+	font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+	white-space: pre-wrap;
+}
+@media (max-width: 900px) {
+	.dlmu-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+	.dlmu-wide { grid-column: span 2; }
+}
+@media (max-width: 520px) {
+	.dlmu-hero { align-items: flex-start; flex-direction: column; }
+	.dlmu-grid { grid-template-columns: 1fr; }
+	.dlmu-wide { grid-column: span 1; }
+	.dlmu-kv { grid-template-columns: 1fr; }
+}
+</style>
+
+<div class="dlmu-wrap">
+	<div class="dlmu-hero">
+		<div>
+			<h2>DLMU 校园网自动登录</h2>
+			<p>旁路由保活、断线重登、Portal 在线信息看板</p>
+		</div>
+		<div class="dlmu-badge"><i class="dlmu-dot"></i><%=online and "校园网在线" or "等待在线/未检测"%></div>
+	</div>
+
+	<div class="dlmu-grid">
+		<div class="dlmu-card">
+			<strong>守护服务</strong>
+			<span><%=running and "运行中" or "未运行"%></span>
+			<small>PID: <%=h(status.pid)%></small>
+		</div>
+		<div class="dlmu-card">
+			<strong>在线时长</strong>
+			<span><%=h(online_duration)%></span>
+			<small><%=h(status.online_since_text)%></small>
+		</div>
+		<div class="dlmu-card">
+			<strong>最近检测</strong>
+			<span><%=h(status.last_check_at_text)%></span>
+			<small>失败次数: <%=h(status.consecutive_failures or 0)%></small>
+		</div>
+		<div class="dlmu-card">
+			<strong>登录重试</strong>
+			<span><%=h(status.login_retries or 0)%> / <%=h(status.max_login_retries or 3)%></span>
+			<small>最近成功: <%=h(status.last_success_at_text)%></small>
+		</div>
+		<div class="dlmu-card">
+			<strong>姓名</strong>
+			<span><%=h(status.campus_user_name)%></span>
+			<small>学号: <%=h(status.campus_user_id)%></small>
+		</div>
+		<div class="dlmu-card">
+			<strong>校园网 IP</strong>
+			<span><%=h(status.campus_user_ip)%></span>
+			<small>MAC: <%=h(status.campus_user_mac)%></small>
+		</div>
+		<div class="dlmu-card">
+			<strong>余额</strong>
+			<span><%=h(status.campus_account_fee)%></span>
+			<small>套餐: <%=h(status.campus_package)%></small>
+		</div>
+		<div class="dlmu-card">
+			<strong>已用流量</strong>
+			<span><%=h(status.campus_used_flow)%></span>
+			<small>Portal 更新时间: <%=h(status.campus_info_at_text)%></small>
+		</div>
+	</div>
+
+	<div class="dlmu-section">
+		<h3>详细状态</h3>
+		<div class="dlmu-kv">
+			<div>校园网在线</div><div><%=h(bool_text(status.online))%></div>
+			<div>状态消息</div><div><%=h(status.message)%></div>
+			<div>最近错误</div><div><%=h(status.last_error)%></div>
+			<div>Portal 信息错误</div><div><%=h(status.portal_info_error)%></div>
+			<div>用户组</div><div><%=h(status.campus_user_group)%></div>
+		</div>
+	</div>
+
+	<div class="dlmu-section">
+		<h3>控制台</h3>
+		<div class="dlmu-actions">
+			<a class="btn cbi-button cbi-button-apply" href="<%=url('admin/services/dlmu-campus/start')%>">启动</a>
+			<a class="btn cbi-button cbi-button-reset" href="<%=url('admin/services/dlmu-campus/stop')%>">停止</a>
+			<a class="btn cbi-button cbi-button-reload" href="<%=url('admin/services/dlmu-campus/restart')%>">重启</a>
+			<a class="btn cbi-button cbi-button-action" href="<%=url('admin/services/dlmu-campus/login')%>">立即登录</a>
+			<a class="btn cbi-button cbi-button-remove" href="<%=url('admin/services/dlmu-campus/portal_logout')%>">Portal 下线</a>
+			<a class="btn cbi-button" href="<%=url('admin/services/dlmu-campus/settings')%>">配置</a>
+		</div>
+		<p style="margin-top:10px;color:#68778b">Portal 下线会先停止守护服务并关闭自动登录，避免下线后立刻被重新登录。</p>
+	</div>
+
+	<div class="dlmu-section">
+		<h3>最近日志</h3>
+		<pre class="dlmu-log"><%=h(sys.exec("tail -n 40 /var/log/dlmu-campus-login.log 2>/dev/null"))%></pre>
+	</div>
+</div>
+
+<%+footer%>
