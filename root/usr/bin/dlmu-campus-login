@@ -1,570 +1,833 @@
-#!/usr/bin/env python3
-import argparse
-import base64
-import json
-import os
-import re
-import signal
-import subprocess
-import sys
-import time
-from datetime import datetime
-from urllib.parse import urljoin, urlparse, parse_qs
-
-import requests
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
-from urllib3.exceptions import InsecureRequestWarning
-
-requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
-
-CONFIG = "dlmu_campus"
-STATUS_DIR = "/var/run/dlmu-campus-login"
-STATUS_FILE = f"{STATUS_DIR}/status.json"
-LOG_FILE = "/var/log/dlmu-campus-login.log"
-
-
-def now():
-    return int(time.time())
-
-
-def iso(ts=None):
-    if not ts:
-        ts = now()
-    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def log(message, level="INFO"):
-    line = f"{iso()} [{level}] {message}"
-    print(line, flush=True)
-    try:
-        with open(LOG_FILE, "a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-    except OSError:
-        pass
-
-
-def uci_get(option, default=""):
-    key = f"{CONFIG}.main.{option}"
-    try:
-        out = subprocess.check_output(["uci", "-q", "get", key], text=True).strip()
-        return out if out != "" else default
-    except Exception:
-        return default
-
-
-def as_int(value, default):
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
-def load_config():
-    auth_base = uci_get("auth_base", "https://id.dlmu.edu.cn").rstrip("/")
-    return {
-        "enabled": uci_get("enabled", "0") == "1",
-        "username": uci_get("username", ""),
-        "password": uci_get("password", ""),
-        "test_url": uci_get("test_url", "http://www.baidu.com"),
-        "portal_url": uci_get("portal_url", "http://portal.dlmu.edu.cn/"),
-        "auth_base": auth_base,
-        "login_url": auth_base + "/login",
-        "online_interval": max(5, as_int(uci_get("online_interval", "30"), 30)),
-        "fast_interval": max(1, as_int(uci_get("fast_interval", "3"), 3)),
-        "failure_threshold": max(1, as_int(uci_get("failure_threshold", "2"), 2)),
-        "max_login_retries": max(1, as_int(uci_get("max_login_retries", "3"), 3)),
-        "login_cooldown": max(10, as_int(uci_get("login_cooldown", "60"), 60)),
-        "portal_info_interval": max(10, as_int(uci_get("portal_info_interval", "60"), 60)),
-        "startup_delay": max(0, as_int(uci_get("startup_delay", "10"), 10)),
-        "timeout": max(2, as_int(uci_get("timeout", "5"), 5)),
-        "verify_tls": uci_get("verify_tls", "0") == "1",
-    }
-
-
-def save_status(**updates):
-    os.makedirs(STATUS_DIR, exist_ok=True)
-    status = read_status()
-    status.update(updates)
-    status["updated_at"] = now()
-    status["updated_at_text"] = iso(status["updated_at"])
-    tmp = STATUS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(status, fh, ensure_ascii=False, indent=2, sort_keys=True)
-    os.replace(tmp, STATUS_FILE)
-
-
-def read_status():
-    try:
-        with open(STATUS_FILE, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except Exception:
-        return {}
-
-
-def fmt_duration(seconds):
-    seconds = max(0, int(seconds or 0))
-    days, seconds = divmod(seconds, 86400)
-    hours, seconds = divmod(seconds, 3600)
-    minutes, seconds = divmod(seconds, 60)
-    if days:
-        return f"{days}d {hours}h {minutes}m"
-    if hours:
-        return f"{hours}h {minutes}m {seconds}s"
-    if minutes:
-        return f"{minutes}m {seconds}s"
-    return f"{seconds}s"
-
-
-def new_session():
-    session = requests.Session()
-    session.trust_env = False
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept-Encoding": "identity",
-    })
-    return session
-
-
-def format_bytes(value):
-    try:
-        num = float(value)
-    except Exception:
-        return str(value or "")
-    units = ["B", "KB", "MB", "GB", "TB", "PB"]
-    idx = 0
-    while num >= 1024 and idx < len(units) - 1:
-        num /= 1024
-        idx += 1
-    if idx == 0:
-        return f"{int(num)} {units[idx]}"
-    return f"{num:.2f} {units[idx]}"
-
-
-def check_network(session, cfg):
-    try:
-        resp = session.get(
-            cfg["test_url"],
-            timeout=cfg["timeout"],
-            allow_redirects=True,
-            verify=cfg["verify_tls"],
-        )
-        return resp.status_code == 200
-    except Exception:
-        return False
-
-
-def extract_redirect(text):
-    patterns = [
-        r"location\.href\s*=\s*['\"]([^'\"]+)['\"]",
-        r"window\.location\s*=\s*['\"]([^'\"]+)['\"]",
-        r"window\.location\.href\s*=\s*['\"]([^'\"]+)['\"]",
-        r"href=[\'\"\u2018]([^\'\"\u2019]+)[\'\"\u2019]</script>",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.I)
-        if match:
-            return match.group(1)
-    return None
-
-
-def aes_encrypt(password, key_b64):
-    key = base64.b64decode(key_b64)
-    cipher = AES.new(key, AES.MODE_ECB)
-    encrypted = cipher.encrypt(pad(password.encode("utf-8"), AES.block_size))
-    return base64.b64encode(encrypted).decode("utf-8")
-
-
-def get_login_params(session, cfg):
-    resp = session.get(
-        cfg["test_url"],
-        timeout=cfg["timeout"],
-        verify=cfg["verify_tls"],
-        allow_redirects=True,
-    )
-    auth_url = resp.url
-    redirect = extract_redirect(resp.text)
-    if redirect:
-        auth_url = urljoin(resp.url, redirect)
-        resp = session.get(auth_url, timeout=cfg["timeout"], verify=cfg["verify_tls"])
-
-    key_match = re.search(r'"login-croypto">(.*?)<', resp.text)
-    exec_match = re.search(r'"login-page-flowkey">(.*?)<', resp.text)
-    if not key_match or not exec_match:
-        raise RuntimeError("cannot extract login-croypto/login-page-flowkey")
-    return auth_url, key_match.group(1), exec_match.group(1)
-
-
-def do_login(session, cfg):
-    if not cfg["username"] or not cfg["password"]:
-        raise RuntimeError("username or password is empty")
-
-    auth_url, key_b64, execution = get_login_params(session, cfg)
-    encrypted_pwd = aes_encrypt(cfg["password"], key_b64)
-    data = {
-        "username": cfg["username"],
-        "type": "UsernamePassword",
-        "_eventId": "submit",
-        "geolocation": "",
-        "execution": execution,
-        "captcha_code": "",
-        "croypto": key_b64,
-        "password": encrypted_pwd,
-    }
-    resp = session.post(cfg["login_url"], data=data, allow_redirects=False, timeout=cfg["timeout"])
-    if resp.status_code not in (302, 303) or "Location" not in resp.headers:
-        raise RuntimeError(f"login failed, http status {resp.status_code}")
-
-    redirect_url = urljoin(auth_url, resp.headers["Location"])
-    session.cookies.clear()
-    resp2 = session.get(redirect_url, timeout=cfg["timeout"], verify=cfg["verify_tls"])
-    if resp2.status_code != 200:
-        raise RuntimeError(f"gateway redirect failed, http status {resp2.status_code}")
-    return redirect_url
-
-
-def extract_user_index(url):
-    try:
-        query = parse_qs(urlparse(url).query)
-        values = query.get("userIndex") or []
-        return values[0] if values else ""
-    except Exception:
-        return ""
-
-
-def parse_ball_info(raw_ball_info):
-    result = {}
-    if not raw_ball_info:
-        return result
-    try:
-        items = json.loads(raw_ball_info)
-    except Exception:
-        return result
-    for item in items:
-        item_id = item.get("id")
-        if item_id == "flow":
-            raw = item.get("valueOnMoveIn") or item.get("value") or ""
-            result["campus_used_flow_raw"] = raw
-            result["campus_used_flow"] = format_bytes(raw)
-        elif item_id == "packageandfee":
-            result["campus_account_fee"] = item.get("value") or ""
-    return result
-
-
-def fetch_portal_info(session, cfg):
-    resp = session.get(
-        cfg["portal_url"],
-        allow_redirects=True,
-        timeout=cfg["timeout"],
-        verify=cfg["verify_tls"],
-    )
-    user_index = extract_user_index(resp.url)
-    if not user_index:
-        raise RuntimeError("未从 portal 页面获取到 userIndex")
-
-    info_url = urljoin(cfg["portal_url"], "/eportal/InterFace.do?method=getOnlineUserInfo")
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "Referer": resp.url,
-    }
-    info_resp = session.post(
-        info_url,
-        data={"userIndex": user_index},
-        headers=headers,
-        timeout=cfg["timeout"],
-    )
-    text = info_resp.content.decode("utf-8", errors="replace")
-    data = json.loads(text)
-    if data.get("result") not in ("success", "wait"):
-        raise RuntimeError(data.get("message") or "portal 在线信息接口返回失败")
-
-    info = {
-        "campus_user_index": user_index,
-        "campus_result": data.get("result", ""),
-        "campus_message": data.get("message", ""),
-        "campus_user_id": data.get("userId", ""),
-        "campus_user_name": data.get("userName", ""),
-        "campus_user_ip": data.get("userIp", ""),
-        "campus_user_mac": data.get("userMac", ""),
-        "campus_user_group": data.get("userGroup", ""),
-        "campus_account_fee": data.get("accountFee", ""),
-        "campus_package": data.get("userPackage", ""),
-        "campus_max_leaving_time": data.get("maxLeavingTime", ""),
-        "campus_max_flow": data.get("maxFlow", ""),
-        "campus_info_at": now(),
-        "campus_info_at_text": iso(),
-    }
-    info.update(parse_ball_info(data.get("ballInfo")))
-    return info
-
-
-def check_campus_online(session, cfg, force_info=False):
-    try:
-        info = fetch_portal_info(session, cfg)
-        save_status(**info, portal_info_error="")
-        return True
-    except Exception as exc:
-        if force_info:
-            save_status(portal_info_error=str(exc), portal_info_error_at=now(),
-                        portal_info_error_at_text=iso())
-        return False
-
-
-def update_portal_info(session, cfg, force=False):
-    status = read_status()
-    last = int(status.get("campus_info_at") or 0)
-    if not force and now() - last < cfg["portal_info_interval"]:
-        return
-    try:
-        info = fetch_portal_info(session, cfg)
-        save_status(**info, portal_info_error="")
-    except Exception as exc:
-        save_status(portal_info_error=str(exc), portal_info_error_at=now(),
-                    portal_info_error_at_text=iso())
-        log(f"获取校园网在线信息失败：{exc}", "WARN")
-
-
-def portal_logout():
-    cfg = load_config()
-    session = new_session()
-    try:
-        info = fetch_portal_info(session, cfg)
-        user_index = info.get("campus_user_index")
-        if not user_index:
-            raise RuntimeError("没有可用的 userIndex")
-        logout_url = urljoin(cfg["portal_url"], "/eportal/InterFace.do?method=logout")
-        resp = session.post(
-            logout_url,
-            data={"userIndex": user_index},
-            headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
-            timeout=cfg["timeout"],
-        )
-        data = json.loads(resp.content.decode("utf-8", errors="replace"))
-        if data.get("result") != "success":
-            raise RuntimeError(data.get("message") or "portal 下线失败")
-        ts = now()
-        save_status(
-            online=False,
-            last_logout_at=ts,
-            last_logout_at_text=iso(ts),
-            message="已通过 Portal 下线",
-            last_error="",
-        )
-        log("已通过 Portal 下线")
-        return 0
-    except Exception as exc:
-        save_status(last_error=str(exc), last_error_at=now(),
-                    last_error_at_text=iso(), message="Portal 下线失败")
-        log(f"Portal 下线失败：{exc}", "ERROR")
-        return 1
-
-
-def once():
-    cfg = load_config()
-    session = new_session()
-    save_status(running=True, pid=os.getpid(), last_manual_login_at=now(), last_manual_login_at_text=iso())
-    try:
-        log("手动检测：检查校园网 Portal 状态")
-        if check_campus_online(session, cfg, force_info=True):
-            status = read_status()
-            online_since = status.get("online_since") or now()
-            save_status(online=True, online_since=online_since, online_since_text=iso(online_since),
-                        last_error="", last_check_at=now(), last_check_at_text=iso(),
-                        message="网络已经在线")
-            log("网络已经在线，无需登录")
-            return 0
-        save_status(online=False, last_login_attempt_at=now(), last_login_attempt_at_text=iso(),
-                    message="手动登录开始")
-        redirect_url = do_login(session, cfg)
-        time.sleep(3)
-        if check_campus_online(session, cfg, force_info=True):
-            ts = now()
-            save_status(online=True, online_since=ts, online_since_text=iso(ts),
-                        last_success_at=ts, last_success_at_text=iso(ts),
-                        last_error="", message=f"登录成功：{redirect_url}")
-            log(f"登录成功：{redirect_url}")
-            return 0
-        raise RuntimeError("登录流程完成，但网络检测仍失败")
-    except Exception as exc:
-        save_status(online=False, last_error=str(exc), last_error_at=now(),
-                    last_error_at_text=iso(), message="手动登录失败")
-        log(f"手动登录失败：{exc}", "ERROR")
-        return 1
-
-
-def daemon():
-    cfg = load_config()
-    if cfg["startup_delay"]:
-        time.sleep(cfg["startup_delay"])
-
-    session = new_session()
-    failures = 0
-    last_login = 0
-    login_retries = 0
-    stop = {"value": False}
-
-    def handle_stop(_signum, _frame):
-        stop["value"] = True
-
-    signal.signal(signal.SIGTERM, handle_stop)
-    signal.signal(signal.SIGINT, handle_stop)
-
-    save_status(running=True, pid=os.getpid(), message="守护进程已启动")
-    log("守护进程已启动")
-
-    while not stop["value"]:
-        cfg = load_config()
-        ts = now()
-        online = check_campus_online(session, cfg, force_info=True)
-        status = read_status()
-
-        if online:
-            if not status.get("online"):
-                online_since = ts
-                log("检测到校园网在线")
-            else:
-                online_since = status.get("online_since") or ts
-            failures = 0
-            login_retries = 0
-            save_status(
-                running=True,
-                pid=os.getpid(),
-                online=True,
-                online_since=online_since,
-                online_since_text=iso(online_since),
-                online_duration=fmt_duration(ts - int(online_since)),
-                consecutive_failures=0,
-                login_retries=0,
-                last_check_at=ts,
-                last_check_at_text=iso(ts),
-                last_error="",
-                message="校园网在线",
-            )
-            sleep_for = cfg["online_interval"]
-        else:
-            failures += 1
-            save_status(
-                running=True,
-                pid=os.getpid(),
-                online=False,
-                consecutive_failures=failures,
-                last_check_at=ts,
-                last_check_at_text=iso(ts),
-                message=f"校园网离线，连续检测失败 {failures} 次",
-            )
-            sleep_for = cfg["fast_interval"]
-            cooldown_passed = ts - last_login >= cfg["login_cooldown"]
-            can_retry = login_retries < cfg["max_login_retries"] or cooldown_passed
-            if failures >= cfg["failure_threshold"] and can_retry:
-                if cooldown_passed and login_retries >= cfg["max_login_retries"]:
-                    login_retries = 0
-                login_retries += 1
-                last_login = ts
-                save_status(last_login_attempt_at=ts, last_login_attempt_at_text=iso(ts),
-                            login_retries=login_retries,
-                            max_login_retries=cfg["max_login_retries"],
-                            message=f"开始登录（第 {login_retries}/{cfg['max_login_retries']} 次）")
-                log(f"检测到离线，开始登录（第 {login_retries}/{cfg['max_login_retries']} 次）")
-                try:
-                    redirect_url = do_login(session, cfg)
-                    time.sleep(3)
-                    if check_campus_online(session, cfg, force_info=True):
-                        success = now()
-                        failures = 0
-                        login_retries = 0
-                        save_status(
-                            online=True,
-                            online_since=success,
-                            online_since_text=iso(success),
-                            online_duration="0s",
-                            consecutive_failures=0,
-                            login_retries=0,
-                            last_success_at=success,
-                            last_success_at_text=iso(success),
-                            last_error="",
-                            message=f"登录成功：{redirect_url}",
-                        )
-                        log(f"登录成功：{redirect_url}")
-                        sleep_for = cfg["online_interval"]
-                    else:
-                        raise RuntimeError("登录流程完成，但网络检测仍失败")
-                except Exception as exc:
-                    save_status(last_error=str(exc), last_error_at=now(),
-                                last_error_at_text=iso(), login_retries=login_retries,
-                                max_login_retries=cfg["max_login_retries"],
-                                message=f"登录失败（第 {login_retries}/{cfg['max_login_retries']} 次）")
-                    log(f"登录失败（第 {login_retries}/{cfg['max_login_retries']} 次）：{exc}", "ERROR")
-                    if login_retries >= cfg["max_login_retries"]:
-                        sleep_for = cfg["login_cooldown"]
-                    else:
-                        sleep_for = cfg["fast_interval"]
-
-        for _ in range(max(1, sleep_for)):
-            if stop["value"]:
-                break
-            time.sleep(1)
-
-    save_status(running=False, message="守护进程已停止")
-    log("守护进程已停止")
-
-
-def status_text():
-    st = read_status()
-    online_since = st.get("online_since")
-    if st.get("online") and online_since:
-        st["online_duration"] = fmt_duration(now() - int(online_since))
-    keys = [
-        ("running", "服务运行"),
-        ("online", "校园网在线"),
-        ("online_duration", "在线时长"),
-        ("online_since_text", "上线时间"),
-        ("last_check_at_text", "最近检测"),
-        ("last_success_at_text", "最近登录成功"),
-        ("last_login_attempt_at_text", "最近登录尝试"),
-        ("consecutive_failures", "连续失败"),
-        ("last_error", "最近错误"),
-        ("portal_info_error", "Portal信息错误"),
-        ("campus_user_id", "学号"),
-        ("campus_user_name", "姓名"),
-        ("campus_user_ip", "校园网IP"),
-        ("campus_user_mac", "校园网MAC"),
-        ("campus_account_fee", "余额"),
-        ("campus_package", "套餐"),
-        ("campus_used_flow", "已用流量"),
-        ("campus_info_at_text", "Portal信息时间"),
-        ("message", "状态消息"),
-        ("pid", "PID"),
-    ]
-    for key, label in keys:
-        value = st.get(key, "")
-        if value is True:
-            value = "是"
-        elif value is False:
-            value = "否"
-        print(f"{label}: {value}")
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--daemon", action="store_true")
-    parser.add_argument("--once", action="store_true")
-    parser.add_argument("--portal-logout", action="store_true")
-    parser.add_argument("--status-text", action="store_true")
-    args = parser.parse_args()
-    if args.status_text:
-        status_text()
-        return 0
-    if args.once:
-        return once()
-    if args.portal_logout:
-        return portal_logout()
-    if args.daemon:
-        daemon()
-        return 0
-    parser.print_help()
-    return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+#!/usr/bin/lua
+
+local nixio = require "nixio"
+local fs = require "nixio.fs"
+local jsonc = require "luci.jsonc"
+
+local CONFIG = "dlmu_campus"
+local STATUS_DIR = "/var/run/dlmu-campus-login"
+local STATUS_FILE = STATUS_DIR .. "/status.json"
+local LOG_FILE = "/var/log/dlmu-campus-login.log"
+local COOKIE_FILE = STATUS_DIR .. "/cookies.txt"
+
+math.randomseed(os.time() + (nixio and nixio.getpid and nixio.getpid() or 0))
+
+local function now()
+	return os.time()
+end
+
+local function pid()
+	return nixio and nixio.getpid and nixio.getpid() or tonumber(fs.readfile("/proc/self/stat"):match("^(%d+)")) or 0
+end
+
+local function iso(ts)
+	return os.date("%Y-%m-%d %H:%M:%S", ts or now())
+end
+
+local function shell_quote(value)
+	value = tostring(value or "")
+	return "'" .. value:gsub("'", "'\\''") .. "'"
+end
+
+local function trim(value)
+	return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function run_capture(cmd)
+	local fh = io.popen(cmd)
+	if not fh then
+		return ""
+	end
+	local out = fh:read("*a") or ""
+	fh:close()
+	return out
+end
+
+local function command_exists(name)
+	local rc = os.execute("command -v " .. shell_quote(name) .. " >/dev/null 2>&1")
+	return rc == true or rc == 0
+end
+
+local function mkdir_p(path)
+	fs.mkdirr(path)
+end
+
+local function log(message, level)
+	level = level or "INFO"
+	local line = string.format("%s [%s] %s", iso(), level, tostring(message or ""))
+	print(line)
+	local fh = io.open(LOG_FILE, "a")
+	if fh then
+		fh:write(line, "\n")
+		fh:close()
+	end
+end
+
+local function uci_get(option, default)
+	local key = CONFIG .. ".main." .. option
+	local out = trim(run_capture("uci -q get " .. shell_quote(key) .. " 2>/dev/null"))
+	if out == "" then
+		return default or ""
+	end
+	return out
+end
+
+local function as_int(value, default)
+	local n = tonumber(value)
+	if not n then
+		return default
+	end
+	return math.floor(n)
+end
+
+local function load_config()
+	local auth_base = (uci_get("auth_base", "https://id.dlmu.edu.cn")):gsub("/+$", "")
+	return {
+		enabled = uci_get("enabled", "0") == "1",
+		username = uci_get("username", ""),
+		password = uci_get("password", ""),
+		test_url = uci_get("test_url", "http://www.baidu.com"),
+		portal_url = uci_get("portal_url", "http://portal.dlmu.edu.cn/"),
+		auth_base = auth_base,
+		login_url = auth_base .. "/login",
+		online_interval = math.max(5, as_int(uci_get("online_interval", "30"), 30)),
+		fast_interval = math.max(1, as_int(uci_get("fast_interval", "3"), 3)),
+		failure_threshold = math.max(1, as_int(uci_get("failure_threshold", "2"), 2)),
+		max_login_retries = math.max(1, as_int(uci_get("max_login_retries", "3"), 3)),
+		login_cooldown = math.max(10, as_int(uci_get("login_cooldown", "60"), 60)),
+		portal_info_interval = math.max(10, as_int(uci_get("portal_info_interval", "60"), 60)),
+		startup_delay = math.max(0, as_int(uci_get("startup_delay", "10"), 10)),
+		timeout = math.max(2, as_int(uci_get("timeout", "5"), 5)),
+		verify_tls = uci_get("verify_tls", "0") == "1",
+	}
+end
+
+local function read_status()
+	local raw = fs.readfile(STATUS_FILE)
+	if not raw or raw == "" then
+		return {}
+	end
+	return jsonc.parse(raw) or {}
+end
+
+local function save_status(updates)
+	mkdir_p(STATUS_DIR)
+	local status = read_status()
+	for key, value in pairs(updates or {}) do
+		status[key] = value
+	end
+	status.updated_at = now()
+	status.updated_at_text = iso(status.updated_at)
+	local tmp = STATUS_FILE .. ".tmp"
+	fs.writefile(tmp, jsonc.stringify(status, true))
+	os.rename(tmp, STATUS_FILE)
+end
+
+local function fmt_duration(seconds)
+	seconds = math.max(0, tonumber(seconds or 0) or 0)
+	local days = math.floor(seconds / 86400)
+	seconds = seconds % 86400
+	local hours = math.floor(seconds / 3600)
+	seconds = seconds % 3600
+	local minutes = math.floor(seconds / 60)
+	seconds = seconds % 60
+	if days > 0 then
+		return string.format("%dd %dh %dm", days, hours, minutes)
+	end
+	if hours > 0 then
+		return string.format("%dh %dm %ds", hours, minutes, seconds)
+	end
+	if minutes > 0 then
+		return string.format("%dm %ds", minutes, seconds)
+	end
+	return string.format("%ds", seconds)
+end
+
+local function tmp_path(label)
+	return string.format("/tmp/dlmu-campus-login.%d.%s.%d", pid(), label, math.random(100000, 999999))
+end
+
+local function urlencode(value)
+	value = tostring(value or "")
+	return (value:gsub("([^%w%-%_%.%~])", function(ch)
+		return string.format("%%%02X", string.byte(ch))
+	end))
+end
+
+local function form_encode(data)
+	local parts = {}
+	for _, item in ipairs(data or {}) do
+		parts[#parts + 1] = urlencode(item[1]) .. "=" .. urlencode(item[2])
+	end
+	if #parts > 0 then
+		return table.concat(parts, "&")
+	end
+	for key, value in pairs(data or {}) do
+		parts[#parts + 1] = urlencode(key) .. "=" .. urlencode(value)
+	end
+	table.sort(parts)
+	return table.concat(parts, "&")
+end
+
+local function urldecode(value)
+	value = tostring(value or ""):gsub("+", " ")
+	return (value:gsub("%%(%x%x)", function(hex)
+		return string.char(tonumber(hex, 16))
+	end))
+end
+
+local function parse_url(url)
+	local scheme, rest = tostring(url or ""):match("^([%w][%w%+%-%.]*)://(.+)$")
+	if not scheme then
+		return nil
+	end
+	local host, path = rest:match("^([^/]*)(/?.*)$")
+	if path == "" then
+		path = "/"
+	end
+	return scheme, host, path
+end
+
+local function urljoin(base, href)
+	href = tostring(href or "")
+	if href:match("^https?://") then
+		return href
+	end
+	local scheme, host, path = parse_url(base)
+	if not scheme then
+		return href
+	end
+	if href:sub(1, 2) == "//" then
+		return scheme .. ":" .. href
+	end
+	if href:sub(1, 1) == "/" then
+		return scheme .. "://" .. host .. href
+	end
+	local dir = path:gsub("[^/]*$", "")
+	return scheme .. "://" .. host .. dir .. href
+end
+
+local function extract_redirect(text)
+	local patterns = {
+		"location%.href%s*=%s*['\"]([^'\"]+)['\"]",
+		"window%.location%s*=%s*['\"]([^'\"]+)['\"]",
+		"window%.location%.href%s*=%s*['\"]([^'\"]+)['\"]",
+		"href=[%'\"‘]([^%'\"’]+)[%'\"’]</script>",
+	}
+	for _, pattern in ipairs(patterns) do
+		local match = tostring(text or ""):match(pattern)
+		if match then
+			return match
+		end
+	end
+	return nil
+end
+
+local function extract_header(headers, name)
+	local lower = name:lower()
+	local value = nil
+	for line in tostring(headers or ""):gmatch("[^\r\n]+") do
+		local key, val = line:match("^([^:]+):%s*(.*)$")
+		if key and key:lower() == lower then
+			value = trim(val)
+		end
+	end
+	return value
+end
+
+local function http_request(cfg, opts)
+	if not command_exists("curl") then
+		error("缺少 curl 命令，请安装 curl")
+	end
+	mkdir_p(STATUS_DIR)
+	local body_file = tmp_path("body")
+	local header_file = tmp_path("headers")
+	local post_file = nil
+	local cmd = {
+		"curl",
+		"-s",
+		"-A", shell_quote("Mozilla/5.0 (X11; Linux) AppleWebKit/537.36"),
+		"--connect-timeout", tostring(cfg.timeout),
+		"-m", tostring(cfg.timeout),
+		"-b", shell_quote(COOKIE_FILE),
+		"-c", shell_quote(COOKIE_FILE),
+		"-D", shell_quote(header_file),
+		"-o", shell_quote(body_file),
+		"-w", shell_quote("%{http_code}\n%{url_effective}"),
+	}
+	if not cfg.verify_tls then
+		cmd[#cmd + 1] = "-k"
+	end
+	if opts.follow then
+		cmd[#cmd + 1] = "-L"
+	end
+	for _, header in ipairs(opts.headers or {}) do
+		cmd[#cmd + 1] = "-H"
+		cmd[#cmd + 1] = shell_quote(header)
+	end
+	if opts.method == "POST" then
+		post_file = tmp_path("post")
+		fs.writefile(post_file, opts.body or form_encode(opts.data))
+		cmd[#cmd + 1] = "-X"
+		cmd[#cmd + 1] = "POST"
+		cmd[#cmd + 1] = "--data-binary"
+		cmd[#cmd + 1] = "@" .. shell_quote(post_file)
+	end
+	cmd[#cmd + 1] = shell_quote(opts.url)
+	local meta = run_capture(table.concat(cmd, " "))
+	local body = fs.readfile(body_file) or ""
+	local headers = fs.readfile(header_file) or ""
+	fs.unlink(body_file)
+	fs.unlink(header_file)
+	if post_file then
+		fs.unlink(post_file)
+	end
+	local status, final_url = meta:match("(%d+)%s*\n(.-)%s*$")
+	return {
+		status = tonumber(status) or 0,
+		final_url = final_url or opts.url,
+		body = body,
+		headers = headers,
+	}
+end
+
+local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local b64bytes = {}
+for i = 1, #b64chars do
+	b64bytes[b64chars:sub(i, i)] = i - 1
+end
+
+local function base64_decode(data)
+	data = tostring(data or ""):gsub("%s+", "")
+	local out = {}
+	for i = 1, #data, 4 do
+		local c1 = data:sub(i, i)
+		local c2 = data:sub(i + 1, i + 1)
+		local c3 = data:sub(i + 2, i + 2)
+		local c4 = data:sub(i + 3, i + 3)
+		local v1 = b64bytes[c1] or 0
+		local v2 = b64bytes[c2] or 0
+		local v3 = b64bytes[c3] or 0
+		local v4 = b64bytes[c4] or 0
+		out[#out + 1] = string.char((v1 * 4 + math.floor(v2 / 16)) % 256)
+		if c3 ~= "" and c3 ~= "=" then
+			out[#out + 1] = string.char(((v2 % 16) * 16 + math.floor(v3 / 4)) % 256)
+		end
+		if c4 ~= "" and c4 ~= "=" then
+			out[#out + 1] = string.char(((v3 % 4) * 64 + v4) % 256)
+		end
+	end
+	return table.concat(out)
+end
+
+local function bytes_to_hex(data)
+	return (data:gsub(".", function(ch)
+		return string.format("%02x", string.byte(ch))
+	end))
+end
+
+local function pkcs7_pad(data, block_size)
+	local pad_len = block_size - (#data % block_size)
+	if pad_len == 0 then
+		pad_len = block_size
+	end
+	return data .. string.rep(string.char(pad_len), pad_len)
+end
+
+local function aes_encrypt(password, key_b64)
+	if not command_exists("openssl") then
+		error("缺少 openssl 命令，请安装 openssl-util")
+	end
+	local key = base64_decode(key_b64)
+	if #key ~= 16 then
+		error("认证页面返回的 AES key 长度异常")
+	end
+	local in_file = tmp_path("plain")
+	local out_file = tmp_path("cipher")
+	fs.writefile(in_file, pkcs7_pad(password, 16))
+	os.execute("chmod 600 " .. shell_quote(in_file) .. " >/dev/null 2>&1")
+	local cmd = table.concat({
+		"openssl enc -aes-128-ecb -nosalt -nopad",
+		"-K", bytes_to_hex(key),
+		"-in", shell_quote(in_file),
+		"-out", shell_quote(out_file),
+		">/dev/null 2>&1",
+	}, " ")
+	local ok = os.execute(cmd)
+	fs.unlink(in_file)
+	if not (ok == true or ok == 0) then
+		fs.unlink(out_file)
+		error("openssl AES 加密失败")
+	end
+	local encoded = trim(run_capture("openssl base64 -A -in " .. shell_quote(out_file) .. " 2>/dev/null"))
+	fs.unlink(out_file)
+	if encoded == "" then
+		error("openssl base64 编码失败")
+	end
+	return encoded
+end
+
+local function get_login_params(session, cfg)
+	local resp = http_request(cfg, { url = cfg.test_url, follow = true })
+	local auth_url = resp.final_url
+	local redirect = extract_redirect(resp.body)
+	if redirect then
+		auth_url = urljoin(resp.final_url, redirect)
+		resp = http_request(cfg, { url = auth_url, follow = true })
+		auth_url = resp.final_url
+	end
+	local key = resp.body:match('"login%-croypto">(.-)<')
+	local execution = resp.body:match('"login%-page%-flowkey">(.-)<')
+	if not key or not execution then
+		error("无法从认证页提取 login-croypto/login-page-flowkey")
+	end
+	return auth_url, key, execution
+end
+
+local function do_login(session, cfg)
+	if cfg.username == "" or cfg.password == "" then
+		error("用户名或密码为空")
+	end
+	fs.unlink(COOKIE_FILE)
+	local auth_url, key_b64, execution = get_login_params(session, cfg)
+	local encrypted_pwd = aes_encrypt(cfg.password, key_b64)
+	local resp = http_request(cfg, {
+		method = "POST",
+		url = cfg.login_url,
+		follow = false,
+		headers = {
+			"Content-Type: application/x-www-form-urlencoded",
+			"Referer: " .. auth_url,
+		},
+		data = {
+			{ "username", cfg.username },
+			{ "type", "UsernamePassword" },
+			{ "_eventId", "submit" },
+			{ "geolocation", "" },
+			{ "execution", execution },
+			{ "captcha_code", "" },
+			{ "croypto", key_b64 },
+			{ "password", encrypted_pwd },
+		},
+	})
+	local location = extract_header(resp.headers, "Location")
+	if (resp.status ~= 302 and resp.status ~= 303) or not location then
+		error("登录失败，HTTP 状态：" .. tostring(resp.status))
+	end
+	local redirect_url = urljoin(auth_url, location)
+	fs.unlink(COOKIE_FILE)
+	local resp2 = http_request(cfg, { url = redirect_url, follow = true })
+	if resp2.status ~= 200 then
+		error("网关跳转失败，HTTP 状态：" .. tostring(resp2.status))
+	end
+	return redirect_url
+end
+
+local function extract_user_index(url)
+	local query = tostring(url or ""):match("%?(.*)$") or ""
+	for key, value in query:gmatch("([^&=]+)=([^&]*)") do
+		if urldecode(key) == "userIndex" then
+			return urldecode(value)
+		end
+	end
+	return ""
+end
+
+local function format_bytes(value)
+	local num = tonumber(value)
+	if not num then
+		return tostring(value or "")
+	end
+	local units = { "B", "KB", "MB", "GB", "TB", "PB" }
+	local idx = 1
+	while num >= 1024 and idx < #units do
+		num = num / 1024
+		idx = idx + 1
+	end
+	if idx == 1 then
+		return string.format("%d %s", num, units[idx])
+	end
+	return string.format("%.2f %s", num, units[idx])
+end
+
+local function parse_ball_info(raw_ball_info)
+	local result = {}
+	if not raw_ball_info or raw_ball_info == "" then
+		return result
+	end
+	local items = jsonc.parse(raw_ball_info)
+	if type(items) ~= "table" then
+		return result
+	end
+	for _, item in ipairs(items) do
+		if item.id == "flow" then
+			local raw = item.valueOnMoveIn or item.value or ""
+			result.campus_used_flow_raw = raw
+			result.campus_used_flow = format_bytes(raw)
+		elseif item.id == "packageandfee" then
+			result.campus_account_fee = item.value or ""
+		end
+	end
+	return result
+end
+
+local function fetch_portal_info(session, cfg)
+	local resp = http_request(cfg, { url = cfg.portal_url, follow = true })
+	local user_index = extract_user_index(resp.final_url)
+	if user_index == "" then
+		error("未从 portal 页面获取到 userIndex")
+	end
+	local info_url = urljoin(cfg.portal_url, "/eportal/InterFace.do?method=getOnlineUserInfo")
+	local info_resp = http_request(cfg, {
+		method = "POST",
+		url = info_url,
+		follow = false,
+		headers = {
+			"Content-Type: application/x-www-form-urlencoded; charset=UTF-8",
+			"Referer: " .. resp.final_url,
+		},
+		data = { userIndex = user_index },
+	})
+	local data = jsonc.parse(info_resp.body)
+	if type(data) ~= "table" then
+		error("portal 在线信息接口返回非 JSON")
+	end
+	if data.result ~= "success" and data.result ~= "wait" then
+		error(data.message or "portal 在线信息接口返回失败")
+	end
+	local info = {
+		campus_user_index = user_index,
+		campus_result = data.result or "",
+		campus_message = data.message or "",
+		campus_user_id = data.userId or "",
+		campus_user_name = data.userName or "",
+		campus_user_ip = data.userIp or "",
+		campus_user_mac = data.userMac or "",
+		campus_user_group = data.userGroup or "",
+		campus_account_fee = data.accountFee or "",
+		campus_package = data.userPackage or "",
+		campus_max_leaving_time = data.maxLeavingTime or "",
+		campus_max_flow = data.maxFlow or "",
+		campus_info_at = now(),
+		campus_info_at_text = iso(),
+	}
+	local ball = parse_ball_info(data.ballInfo)
+	for key, value in pairs(ball) do
+		info[key] = value
+	end
+	return info
+end
+
+local function check_campus_online(session, cfg, force_info)
+	local ok, info = pcall(fetch_portal_info, session, cfg)
+	if ok then
+		info.portal_info_error = ""
+		save_status(info)
+		return true
+	end
+	if force_info then
+		save_status({
+			portal_info_error = tostring(info),
+			portal_info_error_at = now(),
+			portal_info_error_at_text = iso(),
+		})
+	end
+	return false
+end
+
+local function portal_logout()
+	local cfg = load_config()
+	local session = {}
+	local ok, err = pcall(function()
+		local info = fetch_portal_info(session, cfg)
+		local user_index = info.campus_user_index
+		if not user_index or user_index == "" then
+			error("没有可用的 userIndex")
+		end
+		local logout_url = urljoin(cfg.portal_url, "/eportal/InterFace.do?method=logout")
+		local resp = http_request(cfg, {
+			method = "POST",
+			url = logout_url,
+			follow = false,
+			headers = { "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" },
+			data = { userIndex = user_index },
+		})
+		local data = jsonc.parse(resp.body)
+		if type(data) ~= "table" or data.result ~= "success" then
+			error(type(data) == "table" and data.message or "portal 下线失败")
+		end
+		local ts = now()
+		save_status({
+			online = false,
+			last_logout_at = ts,
+			last_logout_at_text = iso(ts),
+			message = "已通过 Portal 下线",
+			last_error = "",
+		})
+		log("已通过 Portal 下线")
+	end)
+	if not ok then
+		save_status({
+			last_error = tostring(err),
+			last_error_at = now(),
+			last_error_at_text = iso(),
+			message = "Portal 下线失败",
+		})
+		log("Portal 下线失败：" .. tostring(err), "ERROR")
+		return 1
+	end
+	return 0
+end
+
+local function once()
+	local cfg = load_config()
+	local session = {}
+	save_status({
+		running = true,
+		pid = pid(),
+		last_manual_login_at = now(),
+		last_manual_login_at_text = iso(),
+	})
+	local ok, err = pcall(function()
+		log("手动检测：检查校园网 Portal 状态")
+		if check_campus_online(session, cfg, true) then
+			local status = read_status()
+			local online_since = status.online_since or now()
+			save_status({
+				online = true,
+				online_since = online_since,
+				online_since_text = iso(online_since),
+				last_error = "",
+				last_check_at = now(),
+				last_check_at_text = iso(),
+				message = "网络已经在线",
+			})
+			log("网络已经在线，无需登录")
+			return
+		end
+		save_status({
+			online = false,
+			last_login_attempt_at = now(),
+			last_login_attempt_at_text = iso(),
+			message = "手动登录开始",
+		})
+		local redirect_url = do_login(session, cfg)
+		os.execute("sleep 3")
+		if check_campus_online(session, cfg, true) then
+			local ts = now()
+			save_status({
+				online = true,
+				online_since = ts,
+				online_since_text = iso(ts),
+				last_success_at = ts,
+				last_success_at_text = iso(ts),
+				last_error = "",
+				message = "登录成功：" .. redirect_url,
+			})
+			log("登录成功：" .. redirect_url)
+			return
+		end
+		error("登录流程完成，但网络检测仍失败")
+	end)
+	if not ok then
+		save_status({
+			online = false,
+			last_error = tostring(err),
+			last_error_at = now(),
+			last_error_at_text = iso(),
+			message = "手动登录失败",
+		})
+		log("手动登录失败：" .. tostring(err), "ERROR")
+		return 1
+	end
+	return 0
+end
+
+local function daemon()
+	local cfg = load_config()
+	if cfg.startup_delay > 0 then
+		os.execute("sleep " .. tostring(cfg.startup_delay))
+	end
+
+	local session = {}
+	local failures = 0
+	local last_login = 0
+	local login_retries = 0
+	local stop = false
+
+	save_status({ running = true, pid = pid(), message = "守护进程已启动" })
+	log("守护进程已启动")
+
+	while not stop do
+		cfg = load_config()
+		local ts = now()
+		local online = check_campus_online(session, cfg, true)
+		local status = read_status()
+		local sleep_for = cfg.fast_interval
+
+		if online then
+			local online_since
+			if not status.online then
+				online_since = ts
+				log("检测到校园网在线")
+			else
+				online_since = status.online_since or ts
+			end
+			failures = 0
+			login_retries = 0
+			save_status({
+				running = true,
+				pid = pid(),
+				online = true,
+				online_since = online_since,
+				online_since_text = iso(online_since),
+				online_duration = fmt_duration(ts - tonumber(online_since)),
+				consecutive_failures = 0,
+				login_retries = 0,
+				last_check_at = ts,
+				last_check_at_text = iso(ts),
+				last_error = "",
+				message = "校园网在线",
+			})
+			sleep_for = cfg.online_interval
+		else
+			failures = failures + 1
+			save_status({
+				running = true,
+				pid = pid(),
+				online = false,
+				consecutive_failures = failures,
+				last_check_at = ts,
+				last_check_at_text = iso(ts),
+				message = string.format("校园网离线，连续检测失败 %d 次", failures),
+			})
+			local cooldown_passed = ts - last_login >= cfg.login_cooldown
+			local can_retry = login_retries < cfg.max_login_retries or cooldown_passed
+			if failures >= cfg.failure_threshold and can_retry then
+				if cooldown_passed and login_retries >= cfg.max_login_retries then
+					login_retries = 0
+				end
+				login_retries = login_retries + 1
+				last_login = ts
+				save_status({
+					last_login_attempt_at = ts,
+					last_login_attempt_at_text = iso(ts),
+					login_retries = login_retries,
+					max_login_retries = cfg.max_login_retries,
+					message = string.format("开始登录（第 %d/%d 次）", login_retries, cfg.max_login_retries),
+				})
+				log(string.format("检测到离线，开始登录（第 %d/%d 次）", login_retries, cfg.max_login_retries))
+				local ok, err = pcall(function()
+					local redirect_url = do_login(session, cfg)
+					os.execute("sleep 3")
+					if check_campus_online(session, cfg, true) then
+						local success = now()
+						failures = 0
+						login_retries = 0
+						save_status({
+							online = true,
+							online_since = success,
+							online_since_text = iso(success),
+							online_duration = "0s",
+							consecutive_failures = 0,
+							login_retries = 0,
+							last_success_at = success,
+							last_success_at_text = iso(success),
+							last_error = "",
+							message = "登录成功：" .. redirect_url,
+						})
+						log("登录成功：" .. redirect_url)
+						sleep_for = cfg.online_interval
+					else
+						error("登录流程完成，但网络检测仍失败")
+					end
+				end)
+				if not ok then
+					save_status({
+						last_error = tostring(err),
+						last_error_at = now(),
+						last_error_at_text = iso(),
+						login_retries = login_retries,
+						max_login_retries = cfg.max_login_retries,
+						message = string.format("登录失败（第 %d/%d 次）", login_retries, cfg.max_login_retries),
+					})
+					log(string.format("登录失败（第 %d/%d 次）：%s", login_retries, cfg.max_login_retries, tostring(err)), "ERROR")
+					if login_retries >= cfg.max_login_retries then
+						sleep_for = cfg.login_cooldown
+					else
+						sleep_for = cfg.fast_interval
+					end
+				end
+			end
+		end
+
+		for _ = 1, math.max(1, sleep_for) do
+			if stop then
+				break
+			end
+			os.execute("sleep 1")
+		end
+	end
+
+	save_status({ running = false, message = "守护进程已停止" })
+	log("守护进程已停止")
+end
+
+local function status_text()
+	local st = read_status()
+	if st.online and st.online_since then
+		st.online_duration = fmt_duration(now() - tonumber(st.online_since))
+	end
+	local keys = {
+		{ "running", "服务运行" },
+		{ "online", "校园网在线" },
+		{ "online_duration", "在线时长" },
+		{ "online_since_text", "上线时间" },
+		{ "last_check_at_text", "最近检测" },
+		{ "last_success_at_text", "最近登录成功" },
+		{ "last_login_attempt_at_text", "最近登录尝试" },
+		{ "consecutive_failures", "连续失败" },
+		{ "last_error", "最近错误" },
+		{ "portal_info_error", "Portal信息错误" },
+		{ "campus_user_id", "学号" },
+		{ "campus_user_name", "姓名" },
+		{ "campus_user_ip", "校园网IP" },
+		{ "campus_user_mac", "校园网MAC" },
+		{ "campus_account_fee", "余额" },
+		{ "campus_package", "套餐" },
+		{ "campus_used_flow", "已用流量" },
+		{ "campus_info_at_text", "Portal信息时间" },
+		{ "message", "状态消息" },
+		{ "pid", "PID" },
+	}
+	for _, item in ipairs(keys) do
+		local value = st[item[1]]
+		if value == true then
+			value = "是"
+		elseif value == false then
+			value = "否"
+		elseif value == nil then
+			value = ""
+		end
+		print(item[2] .. ": " .. tostring(value))
+	end
+end
+
+local function main(args)
+	local mode = args[1]
+	if mode == "--status-text" then
+		status_text()
+		return 0
+	elseif mode == "--once" then
+		return once()
+	elseif mode == "--portal-logout" then
+		return portal_logout()
+	elseif mode == "--daemon" then
+		daemon()
+		return 0
+	end
+	print("Usage: dlmu-campus-login --daemon|--once|--portal-logout|--status-text")
+	return 1
+end
+
+os.exit(main(arg))

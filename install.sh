@@ -10,10 +10,10 @@ fi
 
 if command -v apk >/dev/null 2>&1; then
 	apk update || true
-	apk add python3 python3-requests python3-cryptodome luci-compat || true
+	apk add lua curl openssl-util luci-compat || true
 else
 	opkg update || true
-	opkg install python3 python3-requests python3-cryptodome luci-compat || true
+	opkg install lua curl openssl-util luci-compat || true
 fi
 
 cp -a "$ROOT_DIR/root/." /

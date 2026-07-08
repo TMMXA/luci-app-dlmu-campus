@@ -32,17 +32,17 @@ chmod 600 /etc/config/dlmu_campus
 /etc/init.d/uhttpd restart
 ```
 
-依赖包：
+Lua 版依赖包：
 
 ```sh
-apk add python3 python3-requests python3-cryptodome luci-compat
+apk add lua curl openssl-util luci-compat
 ```
 
 旧版 OpenWrt 如果使用 `opkg`：
 
 ```sh
 opkg update
-opkg install python3 python3-requests python3-cryptodome luci-compat
+opkg install lua curl openssl-util luci-compat
 ```
 
 ## 使用
@@ -78,6 +78,6 @@ opkg install python3 python3-requests python3-cryptodome luci-compat
 
 ## 说明
 
-本项目基于 DLMU 统一认证当前的 AES-128 ECB + PKCS7 登录流程实现。校园网 Portal 页面或认证流程变化时，可能需要同步调整解析逻辑。
+本项目基于 DLMU 统一认证当前的 AES-128 ECB + PKCS7 登录流程实现。后台守护脚本使用 Lua 编写，HTTP 请求调用 `curl`，AES 加密调用 `openssl`，避免引入完整 Python 运行环境。校园网 Portal 页面或认证流程变化时，可能需要同步调整解析逻辑。
 
 仅供学习交流和个人网络维护使用，请遵守校园网使用规定。
