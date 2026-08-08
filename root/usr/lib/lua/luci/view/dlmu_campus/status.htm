@@ -38,6 +38,22 @@ end
 
 local running = sys.call("pgrep -f '/usr/bin/dlmu-campus-login --daemon' >/dev/null 2>&1") == 0
 local online = status.online == true
+local network_state = status.network_state or (online and "online" or "unknown")
+local state_text = ({
+	online = "校园网在线",
+	captive = "等待认证 / 已离线",
+	unknown = "检测异常",
+})[network_state] or "尚未检测"
+local state_color = ({
+	online = "#3ef08a",
+	captive = "#ffda65",
+	unknown = "#ff8e72",
+})[network_state] or "#aeb8c4"
+local state_shadow = ({
+	online = "rgba(62,240,138,.18)",
+	captive = "rgba(255,218,101,.20)",
+	unknown = "rgba(255,142,114,.20)",
+})[network_state] or "rgba(174,184,196,.20)"
 local online_duration = status.online_duration
 if online and status.online_since then
 	online_duration = duration(os.time() - tonumber(status.online_since))
@@ -83,8 +99,8 @@ end
 	width: 10px;
 	height: 10px;
 	border-radius: 50%;
-	background: <%=online and "#3ef08a" or "#ffda65"%>;
-	box-shadow: 0 0 0 4px <%=online and "rgba(62,240,138,.18)" or "rgba(255,218,101,.20)"%>;
+	background: <%=state_color%>;
+	box-shadow: 0 0 0 4px <%=state_shadow%>;
 }
 .dlmu-grid {
 	display: grid;
@@ -171,9 +187,9 @@ end
 	<div class="dlmu-hero">
 		<div>
 			<h2>DLMU 校园网自动登录</h2>
-			<p>旁路由保活、断线重登、Portal 在线信息看板</p>
+			<p>HTTP 响应指纹保活、确认认证页后重登、Portal 信息低频刷新</p>
 		</div>
-		<div class="dlmu-badge"><i class="dlmu-dot"></i><%=online and "校园网在线" or "等待在线/未检测"%></div>
+		<div class="dlmu-badge"><i class="dlmu-dot"></i><%=h(state_text)%></div>
 	</div>
 
 	<div class="dlmu-grid">
@@ -190,12 +206,12 @@ end
 		<div class="dlmu-card">
 			<strong>最近检测</strong>
 			<span><%=h(status.last_check_at_text)%></span>
-			<small>失败次数: <%=h(status.consecutive_failures or 0)%></small>
+			<small>HTTP <%=h(status.probe_http_status)%> · curl <%=h(status.probe_curl_exit)%> · <%=h(status.probe_content_type)%> · <%=h(status.probe_body_bytes or 0)%> B</small>
 		</div>
 		<div class="dlmu-card">
 			<strong>登录重试</strong>
 			<span><%=h(status.login_retries or 0)%> / <%=h(status.max_login_retries or 3)%></span>
-			<small>最近成功: <%=h(status.last_success_at_text)%></small>
+			<small>认证页连续确认: <%=h(status.consecutive_failures or 0)%> 次</small>
 		</div>
 		<div class="dlmu-card">
 			<strong>姓名</strong>
@@ -222,10 +238,16 @@ end
 	<div class="dlmu-section">
 		<h3>详细状态</h3>
 		<div class="dlmu-kv">
-			<div>校园网在线</div><div><%=h(bool_text(status.online))%></div>
+			<div>当前连通性状态</div><div><%=h(state_text)%></div>
+			<div>最近一次确认在线</div><div><%=h(bool_text(status.online))%></div>
 			<div>状态消息</div><div><%=h(status.message)%></div>
+			<div>检测最终主机</div><div><%=h(status.probe_final_host)%></div>
+			<div>检测响应体大小</div><div><%=h(status.probe_body_bytes or 0)%> B</div>
+			<div>检测异常</div><div><%=h(status.probe_error)%></div>
+			<div>连续检测异常</div><div><%=h(status.consecutive_probe_errors or 0)%></div>
 			<div>最近错误</div><div><%=h(status.last_error)%></div>
 			<div>Portal 信息错误</div><div><%=h(status.portal_info_error)%></div>
+			<div>Portal 最近尝试</div><div><%=h(status.portal_info_attempt_at_text)%></div>
 			<div>用户组</div><div><%=h(status.campus_user_group)%></div>
 		</div>
 	</div>
@@ -237,7 +259,7 @@ end
 			<a class="btn cbi-button cbi-button-reset" href="<%=url('admin/services/dlmu-campus/stop')%>">停止</a>
 			<a class="btn cbi-button cbi-button-reload" href="<%=url('admin/services/dlmu-campus/restart')%>">重启</a>
 			<a class="btn cbi-button cbi-button-action" href="<%=url('admin/services/dlmu-campus/login')%>">立即登录</a>
-			<a class="btn cbi-button cbi-button-remove" href="<%=url('admin/services/dlmu-campus/portal_logout')%>">Portal 下线</a>
+			<a class="btn cbi-button cbi-button-remove" href="<%=url('admin/services/dlmu-campus/portal_logout')%>">停用自动登录并 Portal 下线</a>
 			<a class="btn cbi-button" href="<%=url('admin/services/dlmu-campus/settings')%>">配置</a>
 		</div>
 		<p style="margin-top:10px;color:#68778b">Portal 下线会先停止守护服务并关闭自动登录，避免下线后立刻被重新登录。</p>

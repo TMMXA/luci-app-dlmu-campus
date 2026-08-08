@@ -9,6 +9,18 @@ local STATUS_DIR = "/var/run/dlmu-campus-login"
 local STATUS_FILE = STATUS_DIR .. "/status.json"
 local LOG_FILE = "/var/log/dlmu-campus-login.log"
 local COOKIE_FILE = STATUS_DIR .. "/cookies.txt"
+local OPENCLASH_SKIP_GID = 65534
+
+-- OpenClash reserves GID 65534 for router-originated traffic that must bypass
+-- its OUTPUT redirection. Keep the daemon and every curl child in that group,
+-- otherwise DIRECT campus requests can be sent back into Mihomo and rejected
+-- as loopback connections. UID remains root, so protected config is readable.
+if nixio and nixio.setgid and nixio.getgid and nixio.getgid() ~= OPENCLASH_SKIP_GID then
+	local ok, err = nixio.setgid(OPENCLASH_SKIP_GID)
+	if not ok then
+		error("无法切换到 OpenClash 直连 GID：" .. tostring(err))
+	end
+end
 
 math.randomseed(os.time() + (nixio and nixio.getpid and nixio.getpid() or 0))
 
@@ -50,6 +62,9 @@ end
 
 local function mkdir_p(path)
 	fs.mkdirr(path)
+	if path == STATUS_DIR then
+		fs.chmod(path, "0700")
+	end
 end
 
 local function log(message, level)
@@ -60,6 +75,7 @@ local function log(message, level)
 	if fh then
 		fh:write(line, "\n")
 		fh:close()
+		fs.chmod(LOG_FILE, "0600") -- the log can contain account details
 	end
 end
 
@@ -86,16 +102,22 @@ local function load_config()
 		enabled = uci_get("enabled", "0") == "1",
 		username = uci_get("username", ""),
 		password = uci_get("password", ""),
-		test_url = uci_get("test_url", "http://www.baidu.com"),
+		test_url = uci_get("test_url", "http://223.5.5.5"),
+		online_http_status = math.max(100, as_int(uci_get("online_http_status", "404"), 404)),
+		online_content_type = trim(uci_get("online_content_type", "text/plain")):lower(),
+		captive_http_status = math.max(100, as_int(uci_get("captive_http_status", "200"), 200)),
+		captive_content_type = trim(uci_get("captive_content_type", "none")):lower(),
+		login_trigger_url = uci_get("login_trigger_url", "http://223.5.5.5"),
+		campus_dns = uci_get("campus_dns", "10.0.0.1"),
 		portal_url = uci_get("portal_url", "http://portal.dlmu.edu.cn/"),
 		auth_base = auth_base,
 		login_url = auth_base .. "/login",
-		online_interval = math.max(5, as_int(uci_get("online_interval", "30"), 30)),
+		online_interval = math.max(5, as_int(uci_get("online_interval", "10"), 10)),
 		fast_interval = math.max(1, as_int(uci_get("fast_interval", "3"), 3)),
-		failure_threshold = math.max(1, as_int(uci_get("failure_threshold", "2"), 2)),
+		failure_threshold = math.max(1, as_int(uci_get("failure_threshold", "3"), 3)),
 		max_login_retries = math.max(1, as_int(uci_get("max_login_retries", "3"), 3)),
 		login_cooldown = math.max(10, as_int(uci_get("login_cooldown", "60"), 60)),
-		portal_info_interval = math.max(10, as_int(uci_get("portal_info_interval", "60"), 60)),
+		portal_info_interval = math.max(60, as_int(uci_get("portal_info_interval", "300"), 300)),
 		startup_delay = math.max(0, as_int(uci_get("startup_delay", "10"), 10)),
 		timeout = math.max(2, as_int(uci_get("timeout", "5"), 5)),
 		verify_tls = uci_get("verify_tls", "0") == "1",
@@ -120,7 +142,9 @@ local function save_status(updates)
 	status.updated_at_text = iso(status.updated_at)
 	local tmp = STATUS_FILE .. ".tmp"
 	fs.writefile(tmp, jsonc.stringify(status, true))
+	fs.chmod(tmp, "0600")
 	os.rename(tmp, STATUS_FILE)
+	fs.chmod(STATUS_FILE, "0600")
 end
 
 local function fmt_duration(seconds)
@@ -188,6 +212,51 @@ local function parse_url(url)
 	return scheme, host, path
 end
 
+local function url_host(url)
+	local _, authority = parse_url(url)
+	if not authority then
+		return ""
+	end
+	local host = authority:match("^%[([^%]]+)%]") or authority:match("^([^:]+)") or authority
+	return tostring(host):lower()
+end
+
+local function url_port(url)
+	local scheme, authority = parse_url(url)
+	if not scheme or not authority then
+		return nil
+	end
+	local port = authority:match(":(%d+)$")
+	return tonumber(port) or (scheme:lower() == "https" and 443 or 80)
+end
+
+local function is_ip_literal(host)
+	host = tostring(host or "")
+	return host:match("^%d+%.%d+%.%d+%.%d+$") ~= nil or host:find(":", 1, true) ~= nil
+end
+
+local function resolve_with_campus_dns(cfg, url)
+	local host = url_host(url)
+	if host == "" or is_ip_literal(host) then
+		return nil
+	end
+	local out = run_capture(table.concat({
+		"nslookup", shell_quote(host), shell_quote(cfg.campus_dns), "2>/dev/null",
+	}, " "))
+	local answer_section = false
+	for line in tostring(out or ""):gmatch("[^\r\n]+") do
+		if line:match("^Name:%s*") then
+			answer_section = true
+		elseif answer_section then
+			local ip = line:match("^Address%s*%d*:%s*(%d+%.%d+%.%d+%.%d+)")
+			if ip then
+				return ip
+			end
+		end
+	end
+	return nil
+end
+
 local function urljoin(base, href)
 	href = tostring(href or "")
 	if href:match("^https?://") then
@@ -253,13 +322,25 @@ local function http_request(cfg, opts)
 		"-c", shell_quote(COOKIE_FILE),
 		"-D", shell_quote(header_file),
 		"-o", shell_quote(body_file),
-		"-w", shell_quote("%{http_code}\n%{url_effective}"),
+		"-w", shell_quote("%{http_code}\n%{url_effective}\n%{content_type}\n%{exitcode}\n%{errormsg}"),
 	}
 	if not cfg.verify_tls then
 		cmd[#cmd + 1] = "-k"
 	end
 	if opts.follow then
 		cmd[#cmd + 1] = "-L"
+	end
+	if opts.resolve_with_campus_dns then
+		local host = url_host(opts.url)
+		local port = url_port(opts.url)
+		local ip = resolve_with_campus_dns(cfg, opts.url)
+		if host ~= "" and port and not is_ip_literal(host) and not ip then
+			error("校园 DNS " .. cfg.campus_dns .. " 无法解析认证域名 " .. host)
+		end
+		if ip then
+			cmd[#cmd + 1] = "--resolve"
+			cmd[#cmd + 1] = shell_quote(string.format("%s:%d:%s", host, port, ip))
+		end
 	end
 	for _, header in ipairs(opts.headers or {}) do
 		cmd[#cmd + 1] = "-H"
@@ -277,18 +358,156 @@ local function http_request(cfg, opts)
 	local meta = run_capture(table.concat(cmd, " "))
 	local body = fs.readfile(body_file) or ""
 	local headers = fs.readfile(header_file) or ""
+	if fs.stat(COOKIE_FILE) then
+		fs.chmod(COOKIE_FILE, "0600")
+	end
 	fs.unlink(body_file)
 	fs.unlink(header_file)
 	if post_file then
 		fs.unlink(post_file)
 	end
-	local status, final_url = meta:match("(%d+)%s*\n(.-)%s*$")
+	local status, final_url, content_type, exit_code, curl_error = meta:match("^([^\r\n]*)\r?\n([^\r\n]*)\r?\n([^\r\n]*)\r?\n([^\r\n]*)\r?\n?(.*)$")
 	return {
 		status = tonumber(status) or 0,
-		final_url = final_url or opts.url,
+		final_url = trim(final_url) ~= "" and trim(final_url) or opts.url,
+		content_type = trim(content_type ~= "" and content_type or extract_header(headers, "Content-Type")):lower(),
+		exit_code = tonumber(exit_code) or 1,
+		curl_error = trim(curl_error),
 		body = body,
 		headers = headers,
 	}
+end
+
+local function response_error(resp)
+	if resp.exit_code ~= 0 then
+		return string.format("curl 退出码 %d%s", resp.exit_code, resp.curl_error ~= "" and ("：" .. resp.curl_error) or "")
+	end
+	if resp.status == 0 then
+		return "未收到 HTTP 响应"
+	end
+	return nil
+end
+
+local function assert_http_response(resp, context)
+	local err = response_error(resp)
+	if err then
+		error((context or "HTTP 请求失败") .. "：" .. err)
+	end
+end
+
+local function probe_connectivity(cfg)
+	local ok, resp = pcall(http_request, cfg, { url = cfg.test_url, follow = true })
+	if not ok then
+		return {
+			state = "unknown",
+			checked_at = now(),
+			status = 0,
+			content_type = "",
+			final_host = "",
+			exit_code = 1,
+			body_bytes = 0,
+			error = tostring(resp),
+		}
+	end
+
+	local final_host = url_host(resp.final_url)
+	local auth_host = url_host(cfg.auth_base)
+	local portal_host = url_host(cfg.portal_url)
+	local body = tostring(resp.body or "")
+	local body_lower = body:lower()
+	local redirect = extract_redirect(body)
+	local redirect_host = redirect and url_host(urljoin(resp.final_url, redirect)) or ""
+	local has_login_markers = body_lower:find("login%-croypto") and body_lower:find("login%-page%-flowkey")
+	local captive_host = final_host ~= "" and (final_host == auth_host or final_host == portal_host)
+	local captive_redirect = redirect_host ~= "" and (redirect_host == auth_host or redirect_host == portal_host)
+	local captive_type_matches = cfg.captive_content_type == "*"
+		or (cfg.captive_content_type == "none" and resp.content_type == "")
+		or (cfg.captive_content_type ~= "none" and resp.content_type:sub(1, #cfg.captive_content_type) == cfg.captive_content_type)
+	local captive_fingerprint = resp.exit_code == 0
+		and resp.status == cfg.captive_http_status
+		and captive_type_matches
+	local checked_at = now()
+
+	if has_login_markers or captive_host or captive_redirect or captive_fingerprint then
+		return {
+			state = "captive",
+			checked_at = checked_at,
+			status = resp.status,
+			content_type = resp.content_type,
+			final_host = final_host ~= "" and final_host or redirect_host,
+			exit_code = resp.exit_code,
+			body_bytes = #body,
+			error = captive_fingerprint and "命中校园网离线响应指纹" or "检测请求被校园认证页接管",
+		}
+	end
+
+	local transport_error = response_error(resp)
+	if transport_error then
+		return {
+			state = "unknown",
+			checked_at = checked_at,
+			status = resp.status,
+			content_type = resp.content_type,
+			final_host = final_host,
+			exit_code = resp.exit_code,
+			body_bytes = #body,
+			error = transport_error,
+		}
+	end
+
+	local status_matches = resp.status == cfg.online_http_status
+	local content_type_matches = cfg.online_content_type == ""
+		or resp.content_type:sub(1, #cfg.online_content_type) == cfg.online_content_type
+	if status_matches and content_type_matches then
+		return {
+			state = "online",
+			checked_at = checked_at,
+			status = resp.status,
+			content_type = resp.content_type,
+			final_host = final_host,
+			exit_code = resp.exit_code,
+			body_bytes = #body,
+			error = "",
+		}
+	end
+
+	return {
+		state = "unknown",
+		checked_at = checked_at,
+		status = resp.status,
+		content_type = resp.content_type,
+		final_host = final_host,
+		exit_code = resp.exit_code,
+		body_bytes = #body,
+		error = string.format(
+			"响应指纹不匹配（期望 HTTP %d / %s，实际 HTTP %d / %s）",
+			cfg.online_http_status,
+			cfg.online_content_type ~= "" and cfg.online_content_type or "任意 Content-Type",
+			resp.status,
+			resp.content_type ~= "" and resp.content_type or "无 Content-Type"
+		),
+	}
+end
+
+local function probe_updates(probe)
+	return {
+		network_state = probe.state,
+		last_check_at = probe.checked_at,
+		last_check_at_text = iso(probe.checked_at),
+		probe_http_status = probe.status,
+		probe_content_type = probe.content_type,
+		probe_final_host = probe.final_host,
+		probe_curl_exit = probe.exit_code,
+		probe_body_bytes = probe.body_bytes,
+		probe_error = probe.error,
+	}
+end
+
+local function merge_updates(base, extra)
+	for key, value in pairs(extra or {}) do
+		base[key] = value
+	end
+	return base
 end
 
 local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -368,20 +587,56 @@ local function aes_encrypt(password, key_b64)
 end
 
 local function get_login_params(session, cfg)
-	local resp = http_request(cfg, { url = cfg.test_url, follow = true })
-	local auth_url = resp.final_url
-	local redirect = extract_redirect(resp.body)
-	if redirect then
-		auth_url = urljoin(resp.final_url, redirect)
-		resp = http_request(cfg, { url = auth_url, follow = true })
-		auth_url = resp.final_url
+	local candidates = {
+		{ name = "登录触发裸 IP", url = cfg.login_trigger_url, resolve_with_campus_dns = true },
+		{ name = "Portal 地址", url = cfg.portal_url, resolve_with_campus_dns = true },
+		{ name = "统一认证地址", url = cfg.login_url, resolve_with_campus_dns = true },
+	}
+	local errors = {}
+
+	for _, candidate in ipairs(candidates) do
+		local ok, auth_url, key, execution = pcall(function()
+			local resp = http_request(cfg, {
+				url = candidate.url,
+				follow = false,
+				resolve_with_campus_dns = candidate.resolve_with_campus_dns,
+			})
+			assert_http_response(resp, "访问" .. candidate.name .. "失败")
+			local current_url = resp.final_url
+
+			for _ = 1, 4 do
+				local found_key = resp.body:match('"login%-croypto">(.-)<')
+				local found_execution = resp.body:match('"login%-page%-flowkey">(.-)<')
+				if found_key and found_execution then
+					return current_url, found_key, found_execution
+				end
+				local redirect = extract_header(resp.headers, "Location") or extract_redirect(resp.body)
+				if not redirect then
+					break
+				end
+				current_url = urljoin(current_url, redirect)
+				resp = http_request(cfg, {
+					url = current_url,
+					follow = false,
+					resolve_with_campus_dns = true,
+				})
+				assert_http_response(resp, "跟随校园认证跳转失败")
+				current_url = resp.final_url
+			end
+			return nil, "未发现统一认证参数"
+		end)
+
+		if ok and auth_url and key and execution then
+			return auth_url, key, execution
+		end
+		if ok then
+			errors[#errors + 1] = candidate.name .. "：" .. tostring(key or "未发现统一认证参数")
+		else
+			errors[#errors + 1] = candidate.name .. "：" .. tostring(auth_url)
+		end
 	end
-	local key = resp.body:match('"login%-croypto">(.-)<')
-	local execution = resp.body:match('"login%-page%-flowkey">(.-)<')
-	if not key or not execution then
-		error("无法从认证页提取 login-croypto/login-page-flowkey")
-	end
-	return auth_url, key, execution
+
+	error("无法获取校园认证参数；" .. table.concat(errors, "；"))
 end
 
 local function do_login(session, cfg)
@@ -393,8 +648,9 @@ local function do_login(session, cfg)
 	local encrypted_pwd = aes_encrypt(cfg.password, key_b64)
 	local resp = http_request(cfg, {
 		method = "POST",
-		url = cfg.login_url,
+		url = auth_url,
 		follow = false,
+		resolve_with_campus_dns = true,
 		headers = {
 			"Content-Type: application/x-www-form-urlencoded",
 			"Referer: " .. auth_url,
@@ -410,13 +666,19 @@ local function do_login(session, cfg)
 			{ "password", encrypted_pwd },
 		},
 	})
+	assert_http_response(resp, "提交统一认证登录失败")
 	local location = extract_header(resp.headers, "Location")
 	if (resp.status ~= 302 and resp.status ~= 303) or not location then
 		error("登录失败，HTTP 状态：" .. tostring(resp.status))
 	end
 	local redirect_url = urljoin(auth_url, location)
 	fs.unlink(COOKIE_FILE)
-	local resp2 = http_request(cfg, { url = redirect_url, follow = true })
+	local resp2 = http_request(cfg, {
+		url = redirect_url,
+		follow = true,
+		resolve_with_campus_dns = true,
+	})
+	assert_http_response(resp2, "访问校园网关回跳地址失败")
 	if resp2.status ~= 200 then
 		error("网关跳转失败，HTTP 状态：" .. tostring(resp2.status))
 	end
@@ -473,6 +735,7 @@ end
 
 local function fetch_portal_info(session, cfg)
 	local resp = http_request(cfg, { url = cfg.portal_url, follow = true })
+	assert_http_response(resp, "读取 Portal 页面失败")
 	local user_index = extract_user_index(resp.final_url)
 	if user_index == "" then
 		error("未从 portal 页面获取到 userIndex")
@@ -488,6 +751,7 @@ local function fetch_portal_info(session, cfg)
 		},
 		data = { userIndex = user_index },
 	})
+	assert_http_response(info_resp, "读取 Portal 在线信息失败")
 	local data = jsonc.parse(info_resp.body)
 	if type(data) ~= "table" then
 		error("portal 在线信息接口返回非 JSON")
@@ -518,20 +782,35 @@ local function fetch_portal_info(session, cfg)
 	return info
 end
 
-local function check_campus_online(session, cfg, force_info)
+local function refresh_portal_info(session, cfg, force)
+	local status = read_status()
+	local last_refresh = math.max(
+		tonumber(status.campus_info_at or 0) or 0,
+		tonumber(status.portal_info_attempt_at or 0) or 0
+	)
+	if not force and last_refresh > 0 and now() - last_refresh < cfg.portal_info_interval then
+		return true
+	end
+
+	local attempt_at = now()
 	local ok, info = pcall(fetch_portal_info, session, cfg)
 	if ok then
 		info.portal_info_error = ""
+		info.portal_info_error_at = 0
+		info.portal_info_error_at_text = ""
+		info.portal_info_attempt_at = attempt_at
+		info.portal_info_attempt_at_text = iso(attempt_at)
 		save_status(info)
 		return true
 	end
-	if force_info then
-		save_status({
-			portal_info_error = tostring(info),
-			portal_info_error_at = now(),
-			portal_info_error_at_text = iso(),
-		})
-	end
+	save_status({
+		portal_info_error = tostring(info),
+		portal_info_error_at = attempt_at,
+		portal_info_error_at_text = iso(attempt_at),
+		portal_info_attempt_at = attempt_at,
+		portal_info_attempt_at_text = iso(attempt_at),
+	})
+	log("Portal 信息刷新失败（不影响在线判定）：" .. tostring(info), "WARN")
 	return false
 end
 
@@ -559,6 +838,7 @@ local function portal_logout()
 		local ts = now()
 		save_status({
 			online = false,
+			network_state = "captive",
 			last_logout_at = ts,
 			last_logout_at_text = iso(ts),
 			message = "已通过 Portal 下线",
@@ -583,55 +863,66 @@ local function once()
 	local cfg = load_config()
 	local session = {}
 	save_status({
-		running = true,
-		pid = pid(),
 		last_manual_login_at = now(),
 		last_manual_login_at_text = iso(),
 	})
 	local ok, err = pcall(function()
-		log("手动检测：检查校园网 Portal 状态")
-		if check_campus_online(session, cfg, true) then
+		log("手动检测：检查连通性响应指纹")
+		local probe = probe_connectivity(cfg)
+		save_status(probe_updates(probe))
+		if probe.state == "online" then
 			local status = read_status()
 			local online_since = status.online_since or now()
-			save_status({
+			save_status(merge_updates(probe_updates(probe), {
 				online = true,
 				online_since = online_since,
 				online_since_text = iso(online_since),
+				online_duration = fmt_duration(now() - tonumber(online_since)),
+				consecutive_failures = 0,
 				last_error = "",
-				last_check_at = now(),
-				last_check_at_text = iso(),
-				message = "网络已经在线",
-			})
+				message = "连通性响应正常，校园网在线",
+			}))
+			refresh_portal_info(session, cfg, true)
 			log("网络已经在线，无需登录")
 			return
 		end
-		save_status({
+		if probe.state == "unknown" then
+			save_status(merge_updates(probe_updates(probe), {
+				message = "连通性检测异常，手动强制登录",
+			}))
+			log("连通性检测异常，但这是手动操作，将继续尝试登录：" .. probe.error, "WARN")
+		end
+		save_status(merge_updates(probe_updates(probe), {
 			online = false,
 			last_login_attempt_at = now(),
 			last_login_attempt_at_text = iso(),
-			message = "手动登录开始",
-		})
-		local redirect_url = do_login(session, cfg)
+			message = probe.state == "captive" and "已确认离线，手动登录开始" or "手动强制登录开始",
+		}))
+		do_login(session, cfg)
 		os.execute("sleep 3")
-		if check_campus_online(session, cfg, true) then
+		local verify = probe_connectivity(cfg)
+		save_status(probe_updates(verify))
+		if verify.state == "online" then
 			local ts = now()
-			save_status({
+			save_status(merge_updates(probe_updates(verify), {
 				online = true,
 				online_since = ts,
 				online_since_text = iso(ts),
+				online_duration = "0s",
+				consecutive_failures = 0,
 				last_success_at = ts,
 				last_success_at_text = iso(ts),
 				last_error = "",
-				message = "登录成功：" .. redirect_url,
-			})
-			log("登录成功：" .. redirect_url)
+				message = "登录成功，已完成校园网关回跳",
+			}))
+			refresh_portal_info(session, cfg, true)
+			log("登录成功，已完成校园网关回跳")
 			return
 		end
-		error("登录流程完成，但网络检测仍失败")
+		error("登录流程完成，但连通性验证为 " .. verify.state .. "：" .. verify.error)
 	end)
 	if not ok then
 		save_status({
-			online = false,
 			last_error = tostring(err),
 			last_error_at = now(),
 			last_error_at_text = iso(),
@@ -651,31 +942,33 @@ local function daemon()
 
 	local session = {}
 	local failures = 0
+	local probe_failures = 0
 	local last_login = 0
 	local login_retries = 0
-	local stop = false
 
 	save_status({ running = true, pid = pid(), message = "守护进程已启动" })
 	log("守护进程已启动")
 
-	while not stop do
+	while true do
 		cfg = load_config()
 		local ts = now()
-		local online = check_campus_online(session, cfg, true)
+		local probe = probe_connectivity(cfg)
 		local status = read_status()
+		local previous_state = status.network_state or "unknown"
 		local sleep_for = cfg.fast_interval
 
-		if online then
+		if probe.state == "online" then
 			local online_since
-			if not status.online then
+			if status.online ~= true then
 				online_since = ts
 				log("检测到校园网在线")
 			else
 				online_since = status.online_since or ts
 			end
 			failures = 0
+			probe_failures = 0
 			login_retries = 0
-			save_status({
+			save_status(merge_updates(probe_updates(probe), {
 				running = true,
 				pid = pid(),
 				online = true,
@@ -683,24 +976,27 @@ local function daemon()
 				online_since_text = iso(online_since),
 				online_duration = fmt_duration(ts - tonumber(online_since)),
 				consecutive_failures = 0,
+				consecutive_probe_errors = 0,
 				login_retries = 0,
-				last_check_at = ts,
-				last_check_at_text = iso(ts),
 				last_error = "",
-				message = "校园网在线",
-			})
+				message = "连通性响应正常，校园网在线",
+			}))
+			refresh_portal_info(session, cfg, false)
 			sleep_for = cfg.online_interval
-		else
+		elseif probe.state == "captive" then
 			failures = failures + 1
-			save_status({
+			probe_failures = 0
+			if previous_state ~= "captive" then
+				log("检测请求已进入校园认证页")
+			end
+			save_status(merge_updates(probe_updates(probe), {
 				running = true,
 				pid = pid(),
 				online = false,
 				consecutive_failures = failures,
-				last_check_at = ts,
-				last_check_at_text = iso(ts),
-				message = string.format("校园网离线，连续检测失败 %d 次", failures),
-			})
+				consecutive_probe_errors = 0,
+				message = string.format("已确认认证页，连续 %d/%d 次", failures, cfg.failure_threshold),
+			}))
 			local cooldown_passed = ts - last_login >= cfg.login_cooldown
 			local can_retry = login_retries < cfg.max_login_retries or cooldown_passed
 			if failures >= cfg.failure_threshold and can_retry then
@@ -716,30 +1012,35 @@ local function daemon()
 					max_login_retries = cfg.max_login_retries,
 					message = string.format("开始登录（第 %d/%d 次）", login_retries, cfg.max_login_retries),
 				})
-				log(string.format("检测到离线，开始登录（第 %d/%d 次）", login_retries, cfg.max_login_retries))
+				log(string.format("连续 %d 次确认认证页，开始登录（第 %d/%d 次）", failures, login_retries, cfg.max_login_retries))
 				local ok, err = pcall(function()
-					local redirect_url = do_login(session, cfg)
+					do_login(session, cfg)
 					os.execute("sleep 3")
-					if check_campus_online(session, cfg, true) then
+					local verify = probe_connectivity(cfg)
+					save_status(probe_updates(verify))
+					if verify.state == "online" then
 						local success = now()
 						failures = 0
+						probe_failures = 0
 						login_retries = 0
-						save_status({
+						save_status(merge_updates(probe_updates(verify), {
 							online = true,
 							online_since = success,
 							online_since_text = iso(success),
 							online_duration = "0s",
 							consecutive_failures = 0,
+							consecutive_probe_errors = 0,
 							login_retries = 0,
 							last_success_at = success,
 							last_success_at_text = iso(success),
 							last_error = "",
-							message = "登录成功：" .. redirect_url,
-						})
-						log("登录成功：" .. redirect_url)
+							message = "登录成功，已完成校园网关回跳",
+						}))
+						refresh_portal_info(session, cfg, true)
+						log("登录成功，已完成校园网关回跳")
 						sleep_for = cfg.online_interval
 					else
-						error("登录流程完成，但网络检测仍失败")
+						error("登录流程完成，但连通性验证为 " .. verify.state .. "：" .. verify.error)
 					end
 				end)
 				if not ok then
@@ -759,34 +1060,51 @@ local function daemon()
 					end
 				end
 			end
+		else
+			failures = 0
+			probe_failures = probe_failures + 1
+			if previous_state ~= "unknown" then
+				log("连通性检测异常，不触发登录：" .. probe.error, "WARN")
+			end
+			save_status(merge_updates(probe_updates(probe), {
+				running = true,
+				pid = pid(),
+				consecutive_failures = 0,
+				consecutive_probe_errors = probe_failures,
+				message = "连通性检测异常，不触发登录",
+			}))
 		end
 
 		for _ = 1, math.max(1, sleep_for) do
-			if stop then
-				break
-			end
 			os.execute("sleep 1")
 		end
 	end
-
-	save_status({ running = false, message = "守护进程已停止" })
-	log("守护进程已停止")
 end
 
 local function status_text()
 	local st = read_status()
+	local running_rc = os.execute("pgrep -f '/usr/bin/dlmu-campus-login --daemon' >/dev/null 2>&1")
+	st.running = running_rc == true or running_rc == 0
 	if st.online and st.online_since then
 		st.online_duration = fmt_duration(now() - tonumber(st.online_since))
 	end
 	local keys = {
 		{ "running", "服务运行" },
-		{ "online", "校园网在线" },
+		{ "network_state", "连通性状态" },
+		{ "online", "最近确认在线" },
 		{ "online_duration", "在线时长" },
 		{ "online_since_text", "上线时间" },
 		{ "last_check_at_text", "最近检测" },
+		{ "probe_http_status", "HTTP状态" },
+		{ "probe_content_type", "Content-Type" },
+		{ "probe_curl_exit", "curl退出码" },
+		{ "probe_body_bytes", "响应体字节数" },
+		{ "probe_final_host", "最终主机" },
+		{ "probe_error", "检测异常" },
 		{ "last_success_at_text", "最近登录成功" },
 		{ "last_login_attempt_at_text", "最近登录尝试" },
-		{ "consecutive_failures", "连续失败" },
+		{ "consecutive_failures", "连续认证页确认" },
+		{ "consecutive_probe_errors", "连续检测异常" },
 		{ "last_error", "最近错误" },
 		{ "portal_info_error", "Portal信息错误" },
 		{ "campus_user_id", "学号" },
@@ -813,11 +1131,46 @@ local function status_text()
 	end
 end
 
+local function probe_text()
+	local cfg = load_config()
+	local probe = probe_connectivity(cfg)
+	print("state=" .. tostring(probe.state))
+	print("curl_exit=" .. tostring(probe.exit_code))
+	print("http_status=" .. tostring(probe.status))
+	print("content_type=" .. tostring(probe.content_type))
+	print("final_host=" .. tostring(probe.final_host))
+	print("body_bytes=" .. tostring(probe.body_bytes))
+	print("error=" .. tostring(probe.error))
+	return probe.state == "unknown" and 2 or 0
+end
+
+local function auth_test()
+	local cfg = load_config()
+	fs.unlink(COOKIE_FILE)
+	local ok, auth_url = pcall(function()
+		local url = get_login_params({}, cfg)
+		return url
+	end)
+	fs.unlink(COOKIE_FILE)
+	if not ok then
+		print("auth_params=failed")
+		print("error=" .. tostring(auth_url))
+		return 1
+	end
+	print("auth_params=ok")
+	print("auth_host=" .. url_host(auth_url))
+	return 0
+end
+
 local function main(args)
 	local mode = args[1]
 	if mode == "--status-text" then
 		status_text()
 		return 0
+	elseif mode == "--probe" then
+		return probe_text()
+	elseif mode == "--auth-test" then
+		return auth_test()
 	elseif mode == "--once" then
 		return once()
 	elseif mode == "--portal-logout" then
@@ -826,7 +1179,7 @@ local function main(args)
 		daemon()
 		return 0
 	end
-	print("Usage: dlmu-campus-login --daemon|--once|--portal-logout|--status-text")
+	print("Usage: dlmu-campus-login --daemon|--once|--portal-logout|--status-text|--probe|--auth-test")
 	return 1
 end
 

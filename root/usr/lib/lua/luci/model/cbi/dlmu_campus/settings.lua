@@ -1,7 +1,7 @@
 local m, s, o
 
 m = Map("dlmu_campus", translate("DLMU 校园网自动登录"),
-	translate("在旁路由上运行校园网保活守护进程，掉线后自动重登，并在状态页展示 portal 在线信息。"))
+	translate("用独立的 HTTP 响应指纹判断在线/认证页/检测异常；仅在连续确认认证页后重登，Portal 个人信息低频刷新且不参与在线判定。"))
 
 s = m:section(NamedSection, "main", "service", translate("基础设置"))
 s.addremove = false
@@ -19,8 +19,39 @@ o.password = true
 o.rmempty = true
 
 o = s:option(Value, "test_url", translate("连通性检测 URL"))
-o.default = "http://www.baidu.com"
+o.default = "http://223.5.5.5"
 o.rmempty = false
+o.description = translate("建议使用不依赖 DNS 的稳定 HTTP 地址；当前地址在线时固定返回 404 text/plain，离线时会被校园认证页接管。")
+
+o = s:option(Value, "online_http_status", translate("在线响应 HTTP 状态"))
+o.datatype = "uinteger"
+o.default = "404"
+o.rmempty = false
+
+o = s:option(Value, "online_content_type", translate("在线响应 Content-Type 前缀"))
+o.default = "text/plain"
+o.rmempty = false
+o.description = translate("状态码与此前缀同时匹配才确认在线；不匹配但也未发现认证页时只显示检测异常，不会登录。")
+
+o = s:option(Value, "captive_http_status", translate("离线响应 HTTP 状态"))
+o.datatype = "uinteger"
+o.default = "200"
+o.rmempty = false
+
+o = s:option(Value, "captive_content_type", translate("离线响应 Content-Type 前缀"))
+o.default = "none"
+o.rmempty = false
+o.description = translate("填写 none 表示没有 Content-Type，* 表示任意类型。当前校园网手动下线后实测为 HTTP 200 且无 Content-Type。")
+
+o = s:option(Value, "login_trigger_url", translate("登录触发 URL"))
+o.default = "http://223.5.5.5"
+o.rmempty = false
+o.description = translate("仅在执行登录时访问，用于获取校园认证跳转；建议使用不依赖 DNS 的裸 IP。")
+
+o = s:option(Value, "campus_dns", translate("校园网 DNS"))
+o.default = "10.0.0.1"
+o.rmempty = false
+o.description = translate("登录触发使用裸 IP；进入认证流程后，直接用此 DNS 解析 Portal 和统一认证域名。")
 
 o = s:option(Value, "portal_url", translate("Portal 状态页 URL"))
 o.default = "http://portal.dlmu.edu.cn/"
@@ -33,17 +64,17 @@ o.rmempty = false
 o = s:option(Value, "online_interval", translate("在线检测间隔"))
 o.datatype = "uinteger"
 o.default = "10"
-o.description = translate("网络在线时，每隔多少秒检测一次。")
+o.description = translate("网络在线时，每隔多少秒进行一次轻量 HTTP 响应指纹检测。")
 
 o = s:option(Value, "fast_interval", translate("离线快速检测间隔"))
 o.datatype = "uinteger"
 o.default = "3"
 o.description = translate("检测到离线后，每隔多少秒快速复查。")
 
-o = s:option(Value, "failure_threshold", translate("触发登录的连续失败次数"))
+o = s:option(Value, "failure_threshold", translate("触发登录的连续认证页确认次数"))
 o.datatype = "uinteger"
-o.default = "2"
-o.description = translate("连通性检测连续失败达到该次数后，开始登录。")
+o.default = "3"
+o.description = translate("仅计算明确进入校园认证页的次数；curl/DNS/响应指纹异常不会计入，也不会触发登录。")
 
 o = s:option(Value, "max_login_retries", translate("冷却前登录重试次数"))
 o.datatype = "uinteger"
@@ -53,11 +84,12 @@ o.description = translate("登录失败时连续重试该次数，全部失败�
 o = s:option(Value, "login_cooldown", translate("登录失败冷却时间"))
 o.datatype = "uinteger"
 o.default = "60"
-o.description = translate("Minimum seconds between login attempts.")
+o.description = translate("达到登录重试上限后，至少等待多少秒再重试。")
 
 o = s:option(Value, "portal_info_interval", translate("Portal 信息刷新间隔"))
 o.datatype = "uinteger"
-o.default = "60"
+o.default = "300"
+o.description = translate("单位为秒，仅在网络确认在线时读取姓名、余额和流量；失败不会改变在线状态。")
 
 o = s:option(Value, "startup_delay", translate("开机启动延迟"))
 o.datatype = "uinteger"

@@ -5,10 +5,11 @@
 ## 功能
 
 - LuCI 中文配置页和状态页
-- 校园网 Portal 在线检测
-- 断线后自动登录
+- 独立 HTTP 响应指纹检测，区分在线、认证页和检测异常
+- 仅在连续确认进入认证页后自动登录，普通超时或 DNS 故障不会误触发
 - 登录失败重试，达到次数后冷却
-- 显示姓名、学号、IP、MAC、余额、套餐、已用流量、在线时长
+- Portal 个人信息低频独立刷新，不参与在线判定
+- 显示姓名、学号、IP、MAC、余额、套餐、已用流量、在线时长和探测详情
 - 支持手动启动、停止、重启、立即登录、Portal 下线
 - 服务配置存储在 `/etc/config/dlmu_campus`
 
@@ -61,6 +62,7 @@ opkg install lua curl openssl-util luci-compat
 /etc/init.d/dlmu-campus-login start
 /etc/init.d/dlmu-campus-login stop
 /etc/init.d/dlmu-campus-login restart
+/etc/init.d/dlmu-campus-login probe
 /etc/init.d/dlmu-campus-login login
 /etc/init.d/dlmu-campus-login portal_logout
 /etc/init.d/dlmu-campus-login status
@@ -75,6 +77,20 @@ opkg install lua curl openssl-util luci-compat
 ```
 
 其中 `username` 和 `password` 默认为空。仓库不会包含个人账号、密码或运行状态缓存。
+
+默认使用 `http://223.5.5.5` 做不依赖 DNS 的轻量检测，在线响应指纹为 `HTTP 404` 和 `Content-Type: text/plain`，离线响应指纹为 `HTTP 200` 且无 Content-Type。在线时每 10 秒检测一次，发现认证页或离线指纹后每 3 秒复查，连续 3 次确认后登录；姓名、余额和流量等 Portal 信息每 300 秒刷新一次。若检测目标的响应发生变化，可在 LuCI 中调整状态码和 Content-Type 前缀。
+
+自动登录使用单独的 `login_trigger_url` 获取校园认证跳转，默认同样访问裸 IP `http://223.5.5.5`，不依赖 DNS。进入认证流程后，Portal 和统一认证域名通过 `campus_dns` 直接解析，避免离线时公共 DNS 或 Fake-IP 阻断登录。命令行 `login` 在检测状态不明确时仍会按用户意图强制尝试登录；守护进程则继续坚持只对明确离线指纹自动登录。
+
+如果旁路由使用 OpenClash 的 Fake-IP DNS，建议把校园域名固定交给校园网 DNS，并排除 Fake-IP，否则离线时可能无法解析认证地址：
+
+```yaml
+dns:
+  nameserver-policy:
+    "+.dlmu.edu.cn": 10.0.0.1
+  fake-ip-filter:
+    - "+.dlmu.edu.cn"
+```
 
 ## 说明
 
