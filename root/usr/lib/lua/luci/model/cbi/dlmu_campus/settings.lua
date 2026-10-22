@@ -63,7 +63,7 @@ o.rmempty = false
 
 o = s:option(Value, "online_interval", translate("在线检测间隔"))
 o.datatype = "uinteger"
-o.default = "10"
+o.default = "30"
 o.description = translate("网络在线时，每隔多少秒进行一次轻量 HTTP 响应指纹检测。")
 
 o = s:option(Value, "fast_interval", translate("离线快速检测间隔"))
@@ -83,12 +83,12 @@ o.description = translate("登录失败时连续重试该次数，全部失败�
 
 o = s:option(Value, "login_cooldown", translate("登录失败冷却时间"))
 o.datatype = "uinteger"
-o.default = "60"
+o.default = "120"
 o.description = translate("达到登录重试上限后，至少等待多少秒再重试。")
 
 o = s:option(Value, "portal_info_interval", translate("Portal 信息刷新间隔"))
 o.datatype = "uinteger"
-o.default = "300"
+o.default = "900"
 o.description = translate("单位为秒，仅在网络确认在线时读取姓名、余额和流量；失败不会改变在线状态。")
 
 o = s:option(Value, "startup_delay", translate("开机启动延迟"))
@@ -100,8 +100,8 @@ o.datatype = "uinteger"
 o.default = "5"
 
 o = s:option(Flag, "verify_tls", translate("校验 TLS 证书"))
-o.default = "0"
-o.description = translate("校园网劫持门户通常建议关闭，以提高兼容性。")
+o.default = "1"
+o.description = translate("认证密码提交到 HTTPS 统一认证主机；建议保持证书校验开启。")
 
 function m.on_after_commit(self)
 	luci.sys.call("chmod 600 /etc/config/dlmu_campus >/dev/null 2>&1")

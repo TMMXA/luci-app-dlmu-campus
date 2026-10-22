@@ -3,6 +3,10 @@
 local nixio = require "nixio"
 local fs = require "nixio.fs"
 local jsonc = require "luci.jsonc"
+local uci = require "uci"
+local config_values = {}
+local command_cache = {}
+local MAX_LOG_BYTES = 64 * 1024
 
 local CONFIG = "dlmu_campus"
 local STATUS_DIR = "/var/run/dlmu-campus-login"
@@ -56,8 +60,15 @@ local function run_capture(cmd)
 end
 
 local function command_exists(name)
+	if command_cache[name] then
+		return true
+	end
 	local rc = os.execute("command -v " .. shell_quote(name) .. " >/dev/null 2>&1")
-	return rc == true or rc == 0
+	local available = rc == true or rc == 0
+	if available then
+		command_cache[name] = true
+	end
+	return available
 end
 
 local function mkdir_p(path)
@@ -71,6 +82,11 @@ local function log(message, level)
 	level = level or "INFO"
 	local line = string.format("%s [%s] %s", iso(), level, tostring(message or ""))
 	print(line)
+	local stat = fs.stat(LOG_FILE)
+	if stat and stat.size >= MAX_LOG_BYTES then
+		fs.unlink(LOG_FILE .. ".1")
+		fs.rename(LOG_FILE, LOG_FILE .. ".1")
+	end
 	local fh = io.open(LOG_FILE, "a")
 	if fh then
 		fh:write(line, "\n")
@@ -80,8 +96,7 @@ local function log(message, level)
 end
 
 local function uci_get(option, default)
-	local key = CONFIG .. ".main." .. option
-	local out = trim(run_capture("uci -q get " .. shell_quote(key) .. " 2>/dev/null"))
+	local out = trim(config_values[option])
 	if out == "" then
 		return default or ""
 	end
@@ -97,6 +112,9 @@ local function as_int(value, default)
 end
 
 local function load_config()
+	local cursor = uci.cursor()
+	config_values = cursor:get_all(CONFIG, "main") or {}
+	cursor:close()
 	local auth_base = (uci_get("auth_base", "https://id.dlmu.edu.cn")):gsub("/+$", "")
 	return {
 		enabled = uci_get("enabled", "0") == "1",
@@ -112,15 +130,15 @@ local function load_config()
 		portal_url = uci_get("portal_url", "http://portal.dlmu.edu.cn/"),
 		auth_base = auth_base,
 		login_url = auth_base .. "/login",
-		online_interval = math.max(5, as_int(uci_get("online_interval", "10"), 10)),
+		online_interval = math.max(5, as_int(uci_get("online_interval", "30"), 30)),
 		fast_interval = math.max(1, as_int(uci_get("fast_interval", "3"), 3)),
 		failure_threshold = math.max(1, as_int(uci_get("failure_threshold", "3"), 3)),
 		max_login_retries = math.max(1, as_int(uci_get("max_login_retries", "3"), 3)),
-		login_cooldown = math.max(10, as_int(uci_get("login_cooldown", "60"), 60)),
-		portal_info_interval = math.max(60, as_int(uci_get("portal_info_interval", "300"), 300)),
+		login_cooldown = math.max(10, as_int(uci_get("login_cooldown", "120"), 120)),
+		portal_info_interval = math.max(60, as_int(uci_get("portal_info_interval", "900"), 900)),
 		startup_delay = math.max(0, as_int(uci_get("startup_delay", "10"), 10)),
 		timeout = math.max(2, as_int(uci_get("timeout", "5"), 5)),
-		verify_tls = uci_get("verify_tls", "0") == "1",
+		verify_tls = uci_get("verify_tls", "1") == "1",
 	}
 end
 
@@ -168,7 +186,8 @@ local function fmt_duration(seconds)
 end
 
 local function tmp_path(label)
-	return string.format("/tmp/dlmu-campus-login.%d.%s.%d", pid(), label, math.random(100000, 999999))
+	mkdir_p(STATUS_DIR)
+	return string.format("%s/%d.%s.%d", STATUS_DIR, pid(), label, math.random(100000, 999999))
 end
 
 local function urlencode(value)
@@ -645,6 +664,10 @@ local function do_login(session, cfg)
 	end
 	fs.unlink(COOKIE_FILE)
 	local auth_url, key_b64, execution = get_login_params(session, cfg)
+	local auth_scheme = parse_url(auth_url)
+	if auth_scheme ~= "https" or url_host(auth_url) ~= url_host(cfg.auth_base) then
+		error("拒绝向非预期 HTTPS 认证主机提交账号")
+	end
 	local encrypted_pwd = aes_encrypt(cfg.password, key_b64)
 	local resp = http_request(cfg, {
 		method = "POST",
@@ -899,7 +922,7 @@ local function once()
 			message = probe.state == "captive" and "已确认离线，手动登录开始" or "手动强制登录开始",
 		}))
 		do_login(session, cfg)
-		os.execute("sleep 3")
+		nixio.nanosleep(3)
 		local verify = probe_connectivity(cfg)
 		save_status(probe_updates(verify))
 		if verify.state == "online" then
@@ -937,7 +960,7 @@ end
 local function daemon()
 	local cfg = load_config()
 	if cfg.startup_delay > 0 then
-		os.execute("sleep " .. tostring(cfg.startup_delay))
+		nixio.nanosleep(cfg.startup_delay)
 	end
 
 	local session = {}
@@ -1015,7 +1038,7 @@ local function daemon()
 				log(string.format("连续 %d 次确认认证页，开始登录（第 %d/%d 次）", failures, login_retries, cfg.max_login_retries))
 				local ok, err = pcall(function()
 					do_login(session, cfg)
-					os.execute("sleep 3")
+					nixio.nanosleep(3)
 					local verify = probe_connectivity(cfg)
 					save_status(probe_updates(verify))
 					if verify.state == "online" then
@@ -1063,6 +1086,7 @@ local function daemon()
 		else
 			failures = 0
 			probe_failures = probe_failures + 1
+			sleep_for = math.min(cfg.online_interval, cfg.fast_interval * 2 ^ math.min(probe_failures - 1, 6))
 			if previous_state ~= "unknown" then
 				log("连通性检测异常，不触发登录：" .. probe.error, "WARN")
 			end
@@ -1075,9 +1099,7 @@ local function daemon()
 			}))
 		end
 
-		for _ = 1, math.max(1, sleep_for) do
-			os.execute("sleep 1")
-		end
+		nixio.nanosleep(math.max(1, sleep_for))
 	end
 end
 
